@@ -67,6 +67,9 @@ def load_labels(csv_path: str) -> pd.DataFrame:
             
     # Clean up transcripts and labels
     df['transcript'] = df['transcript'].fillna("")
-    df['label'] = pd.to_numeric(df['label'], errors='coerce').fillna(0).astype(int)
+    
+    # Map labels: 1 stays 1 (Usable), 2 becomes 0 (Unusable)
+    # This handles the specific format in the user's training.csv
+    df['label'] = df['label'].apply(lambda x: 1 if str(x) == '1' else 0)
     
     return df

@@ -9,13 +9,19 @@ from src.config import config
 
 class ModelRegister:
     """
-    Packages artifacts and uploads to Azure Blob Storage.
+    Packages artifacts and saves them locally.
     """
     def __init__(self):
-        self.blob_service_client = BlobServiceClient(
-            account_url=config.AZURE_STORAGE_URL, 
-            credential=config.AZURE_SAS_TOKEN
-        )
+        self.blob_service_client = None
+        if config.AZURE_STORAGE_URL and config.AZURE_SAS_TOKEN:
+            try:
+                self.blob_service_client = BlobServiceClient(
+                    account_url=config.AZURE_STORAGE_URL, 
+                    credential=config.AZURE_SAS_TOKEN
+                )
+            except Exception as e:
+                print(f"Azure initialization skipped: {e}")
+        
         self.container_name = "models"
 
     def save_pipeline(self, model, scaler, threshold: float, run_id: str):

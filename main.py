@@ -49,7 +49,7 @@ def main(args):
     final_model = get_model(args.model)
     final_model.fit(X_scaled, y)
 
-    # 8. Register & Upload
+    # 8. Register (Local Save Only)
     register = ModelRegister()
     pipeline_path = register.save_pipeline(final_model, scaler, optimal_threshold, run_id)
     importance_path = register.plot_feature_importance(final_model, X.columns.tolist(), run_id)
@@ -61,11 +61,18 @@ def main(args):
     }
     meta_path = create_metadata(run_id, metrics, config.LGBM_PARAMS)
     
-    artifacts_to_upload = [pipeline_path, meta_path, "confusion_matrix.png"]
+    print(f"\n[DONE] Artifacts saved locally in {config.MODELS_DIR}:")
+    print(f"- Pipeline: {pipeline_path}")
+    print(f"- Metadata: {meta_path}")
     if importance_path:
-        artifacts_to_upload.append(importance_path)
-        
-    if args.upload:
+        print(f"- Feature Importance: {importance_path}")
+    print(f"- Confusion Matrix: confusion_matrix.png")
+
+    # Upload is disabled per user request. Use --upload flag ONLY if credentials are set.
+    if args.upload and register.blob_service_client:
+        artifacts_to_upload = [pipeline_path, meta_path, "confusion_matrix.png"]
+        if importance_path:
+            artifacts_to_upload.append(importance_path)
         register.upload_artifacts(run_id, artifacts_to_upload)
 
     print(f"Pipeline finished successfully. Run ID: {run_id}")

@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import pandas as pd
 import torch
@@ -14,42 +15,47 @@ class FeatureExtractor:
     """
     def __init__(self):
         device = "cuda" if torch.cuda.is_available() else "cpu"
+        # Optimized Whisper Pipeline: FP16 + Batching
         self.asr_pipeline = pipeline(
             "automatic-speech-recognition",
             model=config.WHISPER_MODEL_NAME,
-            device=device
+            device=device,
+            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+            chunk_length_s=30,
+            batch_size=8
         )
         self.text_proc = TextPreprocessor()
 
     def estimate_snr(self, y: np.ndarray) -> float:
         """
-        Estimates Signal-to-Noise Ratio using energy thresholding.
+        Estimates SNR using an adaptive energy threshold.
         """
         if y is None or len(y) == 0: return 0.0
         
-        # Calculate RMS energy in frames
         rms = librosa.feature.rms(y=y)[0]
+        # Adaptive threshold using a percentile of RMS energy (simulating noise floor)
+        noise_floor = np.percentile(rms, 20) 
+        active_mask = rms > (noise_floor * 2) # Heuristic for active speech
         
-        # Simple thresholding to separate active vs silent frames
-        threshold = np.median(rms)
-        active_frames = rms[rms > threshold]
-        silent_frames = rms[rms <= threshold]
+        active_frames = rms[active_mask]
+        silent_frames = rms[~active_mask]
         
         if len(silent_frames) == 0 or np.mean(silent_frames) == 0:
-            return 50.0 # High SNR if no silence found
+            return 50.0
             
-        snr = 10 * np.log10(np.mean(active_frames**2) / np.mean(silent_frames**2))
+        snr = 10 * np.log10(np.mean(active_frames**2) / (np.mean(silent_frames**2) + 1e-10))
         return float(snr)
 
     def get_silence_ratio(self, y: np.ndarray) -> float:
         """
-        Calculates percentage of silence in the audio.
+        Calculates percentage of silence using adaptive thresholding.
         """
         if y is None or len(y) == 0: return 1.0
         
-        # Frames with energy < 0.01 are considered silent
         rms = librosa.feature.rms(y=y)[0]
-        silence_ratio = np.sum(rms < 0.01) / len(rms)
+        # Adaptive silence threshold
+        adaptive_threshold = np.percentile(rms, 30)
+        silence_ratio = np.sum(rms < adaptive_threshold) / len(rms)
         return float(silence_ratio)
 
     def extract_features(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -59,9 +65,24 @@ class FeatureExtractor:
         features_list = []
         
         for idx, row in tqdm(df.iterrows(), total=len(df), desc="Extracting features"):
-            audio_path = os.path.join(config.AUDIO_DIR, row['file_name'])
-            gt_transcript = row['transcript']
+            # Construct path: data/audio/data2/{folder}/{file_name}
+            # Based on user's structure: file_path contains "folder/file_name"
+            file_rel_path = str(row['file_path'])
+            audio_path = os.path.join(config.AUDIO_DIR, "data2", file_rel_path)
             
+            gt_transcript = str(row['transcript'])
+            
+            # Check if file exists before processing
+            if not os.path.exists(audio_path):
+                # Try without data2 just in case structure varies
+                alt_path = os.path.join(config.AUDIO_DIR, file_rel_path)
+                if os.path.exists(alt_path):
+                    audio_path = alt_path
+                else:
+                    if config.VERBOSE:
+                        print(f"Warning: File not found: {audio_path}")
+                    continue
+
             # Load and preprocess audio
             y, sr = AudioPreprocessor.process_audio(audio_path, target_sr=config.SAMPLE_RATE)
             

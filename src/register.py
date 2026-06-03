@@ -2,6 +2,8 @@ import os
 import joblib
 import json
 import datetime
+import matplotlib.pyplot as plt
+import seaborn as sns
 from azure.storage.blob import BlobServiceClient
 from src.config import config
 
@@ -28,6 +30,29 @@ class ModelRegister:
         save_path = os.path.join(config.MODELS_DIR, f"{run_id}_pipeline.pkl")
         joblib.dump(artifacts, save_path)
         return save_path
+
+    def plot_feature_importance(self, model, feature_names, run_id: str):
+        """
+        Generates and saves a feature importance plot.
+        """
+        try:
+            import pandas as pd
+            if hasattr(model, 'feature_importances_'):
+                importances = model.feature_importances_
+                indices = importances.argsort()[::-1]
+                
+                plt.figure(figsize=(10, 6))
+                sns.barplot(x=importances[indices], y=[feature_names[i] for i in indices])
+                plt.title(f'Feature Importance - {run_id}')
+                plt.tight_layout()
+                
+                plot_path = os.path.join(config.MODELS_DIR, f"{run_id}_feature_importance.png")
+                plt.savefig(plot_path)
+                plt.close()
+                return plot_path
+        except Exception as e:
+            print(f"Feature importance plot failed: {e}")
+        return None
 
     def upload_artifacts(self, run_id: str, local_files: list):
         """

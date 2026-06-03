@@ -1,5 +1,6 @@
 import re
 import string
+import unicodedata
 import librosa
 import soundfile as sf
 from num2words import num2words
@@ -16,17 +17,23 @@ class TextPreprocessor:
         Example: "99" -> "chín mươi chín"
         """
         def replace_num(match):
-            return num2words(match.group(), lang='vi')
+            try:
+                return num2words(match.group(), lang='vi')
+            except:
+                return match.group()
         
         return re.sub(r'\d+', replace_num, text)
 
     @staticmethod
     def clean_text(text: str) -> str:
         """
-        Standardizes text: lowercase, remove punctuation, strip.
+        Standardizes text: Unicode NFC, lowercase, remove punctuation, strip.
         """
         if not isinstance(text, str):
             return ""
+        
+        # Unicode Normalization (NFC) - Critical for Vietnamese
+        text = unicodedata.normalize('NFC', text)
         
         # Lowercase
         text = text.lower()

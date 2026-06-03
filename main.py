@@ -52,20 +52,28 @@ def main(args):
     # 8. Register & Upload
     register = ModelRegister()
     pipeline_path = register.save_pipeline(final_model, scaler, optimal_threshold, run_id)
+    importance_path = register.plot_feature_importance(final_model, X.columns.tolist(), run_id)
     
-    # Calculate simple metrics for metadata
-    metrics = {"val_macro_f1": evaluator.optimize_threshold(y, oof_probs)} # Placeholder for actual best f1
+    # Calculate detailed metrics for metadata
+    metrics = {
+        "oof_macro_f1": evaluator.optimize_threshold(y, oof_probs),
+        "optimal_threshold": optimal_threshold
+    }
     meta_path = create_metadata(run_id, metrics, config.LGBM_PARAMS)
     
+    artifacts_to_upload = [pipeline_path, meta_path, "confusion_matrix.png"]
+    if importance_path:
+        artifacts_to_upload.append(importance_path)
+        
     if args.upload:
-        register.upload_artifacts(run_id, [pipeline_path, meta_path, "confusion_matrix.png"])
+        register.upload_artifacts(run_id, artifacts_to_upload)
 
     print(f"Pipeline finished successfully. Run ID: {run_id}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ASR Quality Classifier Training Pipeline")
     parser.add_argument("--model", type=str, default="lightgbm", help="Model type: lightgbm or xgboost")
-    parser.add_argument("--labels-path", type=str, default="data/labels.csv", help="Path to labels CSV")
+    parser.add_argument("--labels-path", type=str, default="data/transcripts/training.csv", help="Path to labels CSV")
     parser.add_argument("--skip-download", action="store_true", help="Skip downloading files from Azure")
     parser.add_argument("--upload", action="store_true", help="Upload artifacts to Azure Blob")
     

@@ -53,6 +53,20 @@ class AzureBlobDownloader:
 
 def load_labels(csv_path: str) -> pd.DataFrame:
     """Reads and cleans labels file."""
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"Labels file not found at: {csv_path}")
+        
     df = pd.read_csv(csv_path)
-    # Expected columns: folder, file_name, transcript, label
+    
+    # Map columns if they don't match the expected names (optional, for robustness)
+    # The user's CSV has: file_path, transcript, label
+    required_cols = ['file_path', 'transcript', 'label']
+    for col in required_cols:
+        if col not in df.columns:
+            raise ValueError(f"Missing required column in CSV: {col}")
+            
+    # Clean up transcripts and labels
+    df['transcript'] = df['transcript'].fillna("")
+    df['label'] = pd.to_numeric(df['label'], errors='coerce').fillna(0).astype(int)
+    
     return df

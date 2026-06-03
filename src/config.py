@@ -37,15 +37,16 @@ class Config:
         "objective": "binary",
         "metric": "auc",
         "boosting_type": "gbdt",
-        "learning_rate": 0.05,
+        "learning_rate": 0.03,  # Adjusted from 0.05
         "num_leaves": 31,
         "feature_fraction": 0.8,
         "bagging_fraction": 0.8,
         "bagging_freq": 5,
         "verbose": -1,
         "random_state": 42,
-        "scale_pos_weight": 2.88,  # Ratio of 2600 (usable) / 900 (unusable)
+        "scale_pos_weight": 0.346,  # Corrected: ratio of minority (900) / majority (2600)
         "n_estimators": 500,
+        "max_depth": 6,
     })
     
     # Feature Extraction

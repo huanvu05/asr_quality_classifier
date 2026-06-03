@@ -5,11 +5,8 @@ librosa
 soundfile
 transformers
 torch
-lightgbm
-xgboost
+torchaudio
 scikit-learn
-jiwer
-num2words
 joblib
 matplotlib
 seaborn

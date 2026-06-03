@@ -1,104 +1,74 @@
 import os
-import numpy as np
-import pandas as pd
 import torch
 import librosa
-from transformers import pipeline
-from jiwer import wer, cer
+import numpy as np
+import pandas as pd
 from tqdm import tqdm
+from transformers import WhisperFeatureExtractor, WhisperModel
 from src.config import config
-from src.preprocessor import TextPreprocessor, AudioPreprocessor
+from src.preprocessor import AudioPreprocessor
 
-class FeatureExtractor:
+class DeepAudioExtractor:
+    """
+    Extracts deep acoustic latent representations (Embeddings) using Whisper's Encoder.
+    """
     def __init__(self):
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        # ÉP BUỘC TIẾNG VIỆT để tránh Whisper nhận diện nhầm ngôn ngữ
-        self.asr_pipeline = pipeline(
-            "automatic-speech-recognition",
-            model=config.WHISPER_MODEL_NAME,
-            device=device,
-            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-            chunk_length_s=30,
-            batch_size=8
-        )
-        self.text_proc = TextPreprocessor()
+        self.device = config.DEVICE
+        print(f"Loading Whisper Encoder ({config.ENCODER_MODEL_NAME}) on {self.device}...")
+        
+        self.feature_extractor = WhisperFeatureExtractor.from_pretrained(config.ENCODER_MODEL_NAME)
+        # Chỉ load phần Encoder để chạy nhanh và tập trung vào âm thanh
+        self.model = WhisperModel.from_pretrained(config.ENCODER_MODEL_NAME).encoder.to(self.device)
+        self.model.eval()
 
-    def get_advanced_acoustic_features(self, y: np.ndarray, sr: int) -> dict:
-        """
-        Trích xuất các đặc trưng phổ sâu để bắt nhiễu và chất lượng âm thanh.
-        """
+    def get_embedding(self, audio_path: str) -> np.ndarray:
+        y, sr = AudioPreprocessor.process_audio(audio_path, target_sr=config.SAMPLE_RATE)
         if y is None or len(y) == 0:
-            return {"snr": 0, "silence_ratio": 1, "spectral_flatness": 1, "mfcc_var": 0}
-        
-        # 1. SNR (Robust version)
-        rms = librosa.feature.rms(y=y)[0]
-        noise_floor = np.percentile(rms, 10) + 1e-10
-        active_speech = rms[rms > (noise_floor * 3)]
-        snr = 10 * np.log10(np.mean(active_speech**2) / (noise_floor**2)) if len(active_speech) > 0 else 0
-        
-        # 2. Spectral Flatness (Độ phẳng phổ - Cao nghĩa là nhiễu trắng nhiều)
-        flatness = np.mean(librosa.feature.spectral_flatness(y=y))
-        
-        # 3. MFCC Variance (Âm thanh tự nhiên có độ biến thiên MFCC đặc trưng)
-        mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
-        mfcc_var = np.mean(np.var(mfccs, axis=1))
-        
-        # 4. Silence Ratio (Absolute)
-        silence_ratio = np.sum(rms < 0.001) / len(rms)
-        
-        return {
-            "snr": float(np.clip(snr, 0, 50)),
-            "silence_ratio": float(silence_ratio),
-            "spectral_flatness": float(flatness),
-            "mfcc_var": float(mfcc_var)
-        }
+            return None
+            
+        try:
+            # 1. Chuyển audio thành Log-Mel Spectrogram 80 dải tần (chuẩn đầu vào của Whisper)
+            inputs = self.feature_extractor(y, sampling_rate=config.SAMPLE_RATE, return_tensors="pt")
+            input_features = inputs.input_features.to(self.device)
+            
+            # 2. Đưa qua Encoder
+            with torch.no_grad():
+                # Shape: [1, sequence_length, hidden_dim (512)]
+                outputs = self.model(input_features)
+                
+            # 3. Pooling: Tính trung bình theo chiều thời gian để ra 1 vector duy nhất đại diện cho cả file
+            # Shape: [512]
+            embedding = outputs.last_hidden_state.mean(dim=1).squeeze().cpu().numpy()
+            return embedding
+        except Exception as e:
+            print(f"Error extracting embedding from {audio_path}: {e}")
+            return None
 
-    def extract_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        features_list = []
-        
-        for idx, row in tqdm(df.iterrows(), total=len(df), desc="Extracting Deep Features"):
+    def process_dataset(self, df: pd.DataFrame, output_path: str):
+        """
+        Quét qua toàn bộ dataset và lưu embedding ra file Parquet hoặc Pickle.
+        Dùng Pickle (joblib) lưu list các numpy array sẽ bảo toàn độ chính xác tốt hơn CSV.
+        """
+        data = []
+        for idx, row in tqdm(df.iterrows(), total=len(df), desc="Extracting Deep Audio Embeddings"):
             file_rel_path = str(row['file_path'])
             audio_path = os.path.join(config.AUDIO_DIR, "data2", file_rel_path)
+            
             if not os.path.exists(audio_path):
                 audio_path = os.path.join(config.AUDIO_DIR, file_rel_path)
+                if not os.path.exists(audio_path): 
+                    continue
             
-            if not os.path.exists(audio_path): continue
-
-            y, sr = AudioPreprocessor.process_audio(audio_path, target_sr=config.SAMPLE_RATE)
-            if y is None: continue
-
-            # 1. Acoustic Features
-            acoustic = self.get_advanced_acoustic_features(y, sr)
-            duration = librosa.get_duration(y=y, sr=sr)
-            
-            # 2. ASR Features (Forced Vietnamese)
-            try:
-                # Ép task='transcribe' và language='vi'
-                asr_out = self.asr_pipeline(audio_path, generate_kwargs={"language": "vi", "task": "transcribe"})
-                hyp_transcript = asr_out["text"]
-                
-                clean_gt = self.text_proc.clean_text(str(row['transcript']))
-                clean_hyp = self.text_proc.clean_text(hyp_transcript)
-                
-                current_wer = wer(clean_gt, clean_hyp) if clean_gt else 1.0
-                current_cer = cer(clean_gt, clean_hyp) if clean_gt else 1.0
-                
-                # Word Count Consistency
-                gt_words = len(clean_gt.split()) + 1
-                hyp_words = len(clean_hyp.split()) + 1
-                word_ratio = hyp_words / gt_words
-            except:
-                current_wer, current_cer, word_ratio = 2.0, 2.0, 0.0
-
-            feat = {
-                "file_name": row['file_name'],
-                "duration": duration,
-                "wer": np.clip(current_wer, 0, 3),
-                "cer": np.clip(current_cer, 0, 3),
-                "word_ratio": np.clip(word_ratio, 0, 3),
-                "label": row['label']
-            }
-            feat.update(acoustic)
-            features_list.append(feat)
-            
-        return pd.DataFrame(features_list)
+            emb = self.get_embedding(audio_path)
+            if emb is not None:
+                data.append({
+                    "file_name": row['file_name'],
+                    "label": row['label'],
+                    "embedding": emb # Lưu trữ vector dạng numpy object
+                })
+        
+        # Lưu thành file nén
+        import joblib
+        joblib.dump(data, output_path)
+        print(f"Saved {len(data)} embeddings to {output_path}")
+        return data

@@ -41,7 +41,9 @@ class Config:
     # Trong bài toán này, dự đoán đúng class 0 rất quan trọng.
     POS_WEIGHT: float = 900 / 2600.0  # ~0.346
     
-    DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
+    # FORCE CPU: The Colab P100 GPU is strictly incompatible with the current PyTorch version.
+    # Running on CPU guarantees success.
+    DEVICE: str = "cpu"
 
     def __post_init__(self):
         os.makedirs(self.AUDIO_DIR, exist_ok=True)

@@ -1,0 +1,16 @@
+azure-storage-blob
+numpy
+pandas
+librosa
+soundfile
+transformers
+torch
+lightgbm
+xgboost
+scikit-learn
+jiwer
+num2words
+joblib
+matplotlib
+seaborn
+tqdm

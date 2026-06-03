@@ -72,7 +72,7 @@ class Evaluator:
         # Use Focal Loss instead of standard BCE
         criterion = FocalLossWithLogits(alpha=config.POS_WEIGHT, gamma=2.0)
         optimizer = torch.optim.AdamW(model.parameters(), lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, verbose=False)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
         
         best_val_loss = float('inf')
         best_model_state = None

@@ -34,8 +34,8 @@ class Config:
     # Imbalance
     POS_WEIGHT: float = 900 / 2600.0  
     
-    # Kích hoạt lại GPU. 
-    # Hy vọng kiến trúc Wav2Vec2 sẽ tương thích với GPU của bạn hơn Whisper.
+    # Cho phép sử dụng lại GPU. 
+    # Bắt buộc người dùng phải chọn T4 GPU trên Kaggle.
     DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
 
     def __post_init__(self):

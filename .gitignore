@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Data & Models (IMPORTANT: Do not commit large datasets or model weights)
+data/audio/*
+data/transcripts/*
+data/*.csv
+data/*.json
+!data/.gitkeep
+
+models/*.pkl
+models/*.json
+models/*.png
+
+# Project specific outputs
+confusion_matrix.png
+data/*_features.csv
+
+# Environment & Secrets
+.env
+.venv
+venv/
+ENV/
+*.sas_token
+
+# OS specific
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Notebooks
+.ipynb_checkpoints

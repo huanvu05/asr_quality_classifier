@@ -4,71 +4,77 @@ import librosa
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-from transformers import WhisperFeatureExtractor, WhisperModel
+from transformers import Wav2Vec2FeatureExtractor, Wav2Vec2Model
 from src.config import config
 from src.preprocessor import AudioPreprocessor
+import joblib
 
-class DeepAudioExtractor:
+class DeepAudioExtractorSOTA:
     """
-    Extracts deep acoustic latent representations (Embeddings) using Whisper's Encoder.
+    State-of-the-Art Feature Extractor using Wav2Vec2-Large-XLSR-53.
+    Extracts FULL sequence representations for Attention processing, not just a mean vector.
     """
     def __init__(self):
-        # FORCE CPU: The Colab P100 GPU is strictly incompatible with the current PyTorch version's CUDA kernels.
-        # Running on CPU guarantees success, albeit slower. 
-        self.device = "cpu" 
-        print(f"Loading Whisper Encoder ({config.ENCODER_MODEL_NAME}) on {self.device} (Forced for compatibility)...")
+        self.device = config.DEVICE
+        print(f"Loading Wav2Vec2 Encoder ({config.ENCODER_MODEL_NAME}) on {self.device}...")
         
-        self.feature_extractor = WhisperFeatureExtractor.from_pretrained(config.ENCODER_MODEL_NAME)
-        self.model = WhisperModel.from_pretrained(config.ENCODER_MODEL_NAME).encoder.to(self.device)
+        self.feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(config.ENCODER_MODEL_NAME)
+        self.model = Wav2Vec2Model.from_pretrained(config.ENCODER_MODEL_NAME).to(self.device)
         self.model.eval()
 
-    def get_embedding(self, audio_path: str) -> np.ndarray:
+    def get_sequence_embedding(self, audio_path: str) -> np.ndarray:
         y, sr = AudioPreprocessor.process_audio(audio_path, target_sr=config.SAMPLE_RATE)
         if y is None or len(y) == 0:
             return None
             
         try:
-            # 1. Chuyển audio thành Log-Mel Spectrogram 80 dải tần
             inputs = self.feature_extractor(y, sampling_rate=config.SAMPLE_RATE, return_tensors="pt")
-            input_features = inputs.input_features.to(self.device)
+            input_values = inputs.input_values.to(self.device)
             
-            # 2. Đưa qua Encoder
             with torch.no_grad():
-                # Shape: [1, sequence_length, hidden_dim (512)]
-                outputs = self.model(input_features)
+                # Extract latent representation from the final layer
+                # Shape: [1, sequence_length, 1024]
+                outputs = self.model(input_values)
+                hidden_states = outputs.last_hidden_state.squeeze(0).cpu().numpy()
                 
-            # 3. Pooling
-            embedding = outputs.last_hidden_state.mean(dim=1).squeeze().cpu().numpy()
-            return embedding
+                # We do NOT mean-pool here. We keep the sequence to feed into the Attention Head later.
+                # Just pad or truncate to MAX_SEQ_LENGTH to standardize input sizes
+                seq_len = hidden_states.shape[0]
+                max_len = config.MAX_SEQ_LENGTH
+                
+                if seq_len < max_len:
+                    pad_width = max_len - seq_len
+                    # Pad with zeros
+                    hidden_states = np.pad(hidden_states, ((0, pad_width), (0, 0)), mode='constant')
+                elif seq_len > max_len:
+                    # Truncate
+                    hidden_states = hidden_states[:max_len, :]
+                    
+            return hidden_states
         except Exception as e:
-            print(f"Error extracting embedding from {audio_path}: {e}")
+            # print(f"Error extracting embedding from {audio_path}: {e}")
             return None
 
     def process_dataset(self, df: pd.DataFrame, output_path: str):
-        """
-        Quét qua toàn bộ dataset và lưu embedding ra file Parquet hoặc Pickle.
-        Dùng Pickle (joblib) lưu list các numpy array sẽ bảo toàn độ chính xác tốt hơn CSV.
-        """
         data = []
-        for idx, row in tqdm(df.iterrows(), total=len(df), desc="Extracting Deep Audio Embeddings"):
+        for idx, row in tqdm(df.iterrows(), total=len(df), desc="Extracting SOTA Sequence Embeddings"):
             file_rel_path = str(row['file_path'])
-            audio_path = os.path.join(config.AUDIO_DIR, "data2", file_rel_path)
+            audio_path = os.path.join(config.AUDIO_DIR, file_rel_path)
             
-            if not os.path.exists(audio_path):
-                audio_path = os.path.join(config.AUDIO_DIR, file_rel_path)
-                if not os.path.exists(audio_path): 
+            if not os.path.exists(audio_path): 
+                # Try fallback just in case
+                audio_path = os.path.join(config.DATA_DIR, "audio", "training_audio", file_rel_path)
+                if not os.path.exists(audio_path):
                     continue
             
-            emb = self.get_embedding(audio_path)
-            if emb is not None:
+            seq_emb = self.get_sequence_embedding(audio_path)
+            if seq_emb is not None:
                 data.append({
                     "file_name": row['file_name'],
                     "label": row['label'],
-                    "embedding": emb # Lưu trữ vector dạng numpy object
+                    "embedding": seq_emb # Shape: [MAX_SEQ_LENGTH, 1024]
                 })
         
-        # Lưu thành file nén
-        import joblib
         joblib.dump(data, output_path)
-        print(f"Saved {len(data)} embeddings to {output_path}")
+        print(f"Saved {len(data)} sequence embeddings to {output_path}")
         return data

@@ -1,19 +1,33 @@
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import classification_report, confusion_matrix, f1_score, roc_auc_score
 import matplotlib.pyplot as plt
 import seaborn as sns
 from src.config import config
-from src.model import AudioDataset, AudioMLP
+from src.model import SequenceAudioDataset, AttentionHeadClassifier
 import copy
 
+class FocalLossWithLogits(nn.Module):
+    """
+    Focal Loss designed to address severe class imbalance by focusing on hard-to-classify examples.
+    """
+    def __init__(self, alpha=config.POS_WEIGHT, gamma=2.0):
+        super(FocalLossWithLogits, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, inputs, targets):
+        # inputs are raw logits
+        bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+        pt = torch.exp(-bce_loss) # Prevents nans when probability 0
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
+        return focal_loss.mean()
+
 class Evaluator:
-    """
-    Handles Stratified K-Fold Training for the PyTorch MLP.
-    """
     def __init__(self, n_folds: int = config.N_FOLDS):
         self.n_folds = n_folds
         self.skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=config.SEED)
@@ -36,9 +50,9 @@ class Evaluator:
     def evaluate_oof(self, y_true: np.ndarray, y_probs: np.ndarray, threshold: float):
         y_pred = (y_probs >= threshold).astype(int)
         
-        print("\n" + "="*30)
-        print("FINAL EVALUATION REPORT (PyTorch DNN)")
-        print("="*30)
+        print("\n" + "="*40)
+        print("FINAL EVALUATION REPORT (SOTA ATTENTION)")
+        print("="*40)
         print(f"Optimal Threshold: {threshold:.4f}")
         print(classification_report(y_true, y_pred))
         
@@ -55,13 +69,14 @@ class Evaluator:
         plt.close()
 
     def train_model(self, model, train_loader, val_loader):
-        """Train a single PyTorch model with Early Stopping."""
-        criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([config.POS_WEIGHT]).to(self.device))
+        # Use Focal Loss instead of standard BCE
+        criterion = FocalLossWithLogits(alpha=config.POS_WEIGHT, gamma=2.0)
         optimizer = torch.optim.AdamW(model.parameters(), lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, verbose=False)
         
         best_val_loss = float('inf')
         best_model_state = None
-        patience, max_patience = 0, 10
+        patience, max_patience = 0, 8
         
         for epoch in range(config.EPOCHS):
             model.train()
@@ -86,6 +101,7 @@ class Evaluator:
                     val_loss += criterion(outputs, y_batch).item()
             
             val_loss /= len(val_loader)
+            scheduler.step(val_loss)
             
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -106,22 +122,20 @@ class Evaluator:
             X_train, X_val = embeddings[train_idx], embeddings[val_idx]
             y_train, y_val = labels[train_idx], labels[val_idx]
             
-            train_dataset = AudioDataset(X_train, y_train)
-            val_dataset = AudioDataset(X_val, y_val)
+            train_dataset = SequenceAudioDataset(X_train, y_train)
+            val_dataset = SequenceAudioDataset(X_val, y_val)
             
             train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True)
             val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, shuffle=False)
             
-            model = AudioMLP().to(self.device)
+            model = AttentionHeadClassifier().to(self.device)
             model = self.train_model(model, train_loader, val_loader)
             
-            # Inference on validation set
             model.eval()
             val_probs = []
             with torch.no_grad():
                 for X_batch, _ in val_loader:
                     X_batch = X_batch.to(self.device)
-                    # Apply sigmoid to convert logits to probabilities
                     probs = torch.sigmoid(model(X_batch)).cpu().numpy()
                     val_probs.extend(probs.flatten())
             

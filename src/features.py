@@ -13,11 +13,12 @@ class DeepAudioExtractor:
     Extracts deep acoustic latent representations (Embeddings) using Whisper's Encoder.
     """
     def __init__(self):
-        self.device = config.DEVICE
-        print(f"Loading Whisper Encoder ({config.ENCODER_MODEL_NAME}) on {self.device}...")
+        # FORCE CPU: The Colab P100 GPU is strictly incompatible with the current PyTorch version's CUDA kernels.
+        # Running on CPU guarantees success, albeit slower. 
+        self.device = "cpu" 
+        print(f"Loading Whisper Encoder ({config.ENCODER_MODEL_NAME}) on {self.device} (Forced for compatibility)...")
         
         self.feature_extractor = WhisperFeatureExtractor.from_pretrained(config.ENCODER_MODEL_NAME)
-        # Chỉ load phần Encoder để chạy nhanh và tập trung vào âm thanh
         self.model = WhisperModel.from_pretrained(config.ENCODER_MODEL_NAME).encoder.to(self.device)
         self.model.eval()
 
@@ -27,7 +28,7 @@ class DeepAudioExtractor:
             return None
             
         try:
-            # 1. Chuyển audio thành Log-Mel Spectrogram 80 dải tần (chuẩn đầu vào của Whisper)
+            # 1. Chuyển audio thành Log-Mel Spectrogram 80 dải tần
             inputs = self.feature_extractor(y, sampling_rate=config.SAMPLE_RATE, return_tensors="pt")
             input_features = inputs.input_features.to(self.device)
             
@@ -36,8 +37,7 @@ class DeepAudioExtractor:
                 # Shape: [1, sequence_length, hidden_dim (512)]
                 outputs = self.model(input_features)
                 
-            # 3. Pooling: Tính trung bình theo chiều thời gian để ra 1 vector duy nhất đại diện cho cả file
-            # Shape: [512]
+            # 3. Pooling
             embedding = outputs.last_hidden_state.mean(dim=1).squeeze().cpu().numpy()
             return embedding
         except Exception as e:

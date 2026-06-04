@@ -20,26 +20,28 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # ==========================================
 # 2. CẤU TRÚC DỮ LIỆU & ĐẦU VÀO
 # ==========================================
-CSV_PATH = "data/labels.csv"
+# Cập nhật đường dẫn theo đúng môi trường Kaggle/Colab của bạn
+PROJECT_DIR = "/kaggle/working/asr_quality_classifier"
+
+CSV_PATH = os.path.join(PROJECT_DIR, "data", "labels.csv")
+# Dự phòng nếu bạn đang dùng file training.csv như các vòng lặp trước
 if not os.path.exists(CSV_PATH):
-    CSV_PATH = "data/transcripts/training.csv"
+    CSV_PATH = os.path.join(PROJECT_DIR, "data", "transcripts", "training.csv")
 
-AUDIO_ROOT = "data/audio/data2"
-# Tìm kiếm tệp .pkl một cách tương đối
-EMBEDDINGS_PATH = None
-for root, dirs, files in os.walk("data"):
-    for file in files:
-        if file.endswith("embeddings.pkl"):
-            EMBEDDINGS_PATH = os.path.join(root, file)
-            break
-    if EMBEDDINGS_PATH:
-        break
+AUDIO_ROOT = os.path.join(PROJECT_DIR, "data", "audio", "data2")
+EMBEDDINGS_PATH = os.path.join(PROJECT_DIR, "data", "test_embeddings.pkl") # Cập nhật file pkl hiện tại
+MODELS_DIR = os.path.join(PROJECT_DIR, "models")
 
-if not EMBEDDINGS_PATH:
-    # Fallback cho lúc chưa có
-    EMBEDDINGS_PATH = "data/deep_audio_embeddings.pkl"
+# Cố gắng tự điều chỉnh nếu không chạy trên Kaggle
+if not os.path.exists(PROJECT_DIR):
+    PROJECT_DIR = "."
+    CSV_PATH = "data/labels.csv"
+    if not os.path.exists(CSV_PATH):
+        CSV_PATH = "data/transcripts/training.csv"
+    AUDIO_ROOT = "data/audio/data2"
+    EMBEDDINGS_PATH = "data/test_embeddings.pkl"
+    MODELS_DIR = "models"
 
-MODELS_DIR = "models"
 os.makedirs(MODELS_DIR, exist_ok=True)
 
 # ==========================================

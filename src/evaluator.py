@@ -8,7 +8,7 @@ from sklearn.metrics import classification_report, confusion_matrix, f1_score, r
 import matplotlib.pyplot as plt
 import seaborn as sns
 from src.config import config
-from src.model import AudioDataset, AudioDNN
+from src.model import SequenceAudioDataset, AttentionHeadClassifier
 import copy
 
 class Evaluator:
@@ -33,7 +33,7 @@ class Evaluator:
         y_pred = (y_probs >= threshold).astype(int)
         
         print("\n" + "="*40)
-        print("FINAL EVALUATION REPORT (SINGLE FOLD)")
+        print("FINAL EVALUATION REPORT (WAV2VEC2 ATTENTION)")
         print("="*40)
         print(f"Optimal Threshold: {threshold:.4f}")
         print(classification_report(y_true, y_pred))
@@ -51,12 +51,12 @@ class Evaluator:
         plt.close()
 
     def train_model(self, model, train_loader, val_loader):
-        # Tận dụng Multi-GPU (T4 x2)
+        # Tận dụng Multi-GPU (T4 x2) nếu chạy trên CUDA
         if torch.cuda.device_count() > 1 and self.device == "cuda":
             print(f"🚀 Kích hoạt chạy song song trên {torch.cuda.device_count()} GPUs!")
             model = nn.DataParallel(model)
 
-        # Standard BCE with explicit positive weight
+        # Trở về Loss nguyên bản, tập trung bắt lỗi 0
         pos_weight = torch.tensor([config.POS_WEIGHT]).to(self.device)
         criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
         
@@ -66,9 +66,9 @@ class Evaluator:
         best_val_loss = float('inf')
         best_model_state = None
         
-        checkpoint_path = os.path.join(config.MODELS_DIR, "best_model.pth")
+        checkpoint_path = os.path.join(config.MODELS_DIR, "best_sota_model.pth")
         
-        print("\n--- Bắt đầu quá trình huấn luyện DNN (1 Fold) ---")
+        print("\n--- Bắt đầu huấn luyện SOTA Attention (1 Fold) ---")
         for epoch in range(config.EPOCHS):
             model.train()
             train_loss = 0
@@ -96,7 +96,7 @@ class Evaluator:
             val_loss /= len(val_loader)
             scheduler.step(val_loss)
             
-            # Lưu model tốt nhất
+            # Liên tục lưu model tốt nhất vật lý
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 best_model_state = copy.deepcopy(model.state_dict())
@@ -109,7 +109,6 @@ class Evaluator:
                 if (epoch + 1) % 5 == 0 or epoch == 0:
                     print(f"Epoch {epoch+1:03d}/{config.EPOCHS} | Train Loss: {train_loss:.5f} | Val Loss: {val_loss:.5f}")
                     
-        # Load best weights
         if os.path.exists(checkpoint_path):
              model_to_load = model.module if isinstance(model, nn.DataParallel) else model
              model_to_load.load_state_dict(torch.load(checkpoint_path))
@@ -125,13 +124,13 @@ class Evaluator:
         
         print(f"Training on {len(X_train)} samples, Validating on {len(X_val)} samples.")
         
-        train_dataset = AudioDataset(X_train, y_train)
-        val_dataset = AudioDataset(X_val, y_val)
+        train_dataset = SequenceAudioDataset(X_train, y_train)
+        val_dataset = SequenceAudioDataset(X_val, y_val)
         
         train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True)
         val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, shuffle=False)
         
-        model = AudioDNN().to(self.device)
+        model = AttentionHeadClassifier().to(self.device)
         model = self.train_model(model, train_loader, val_loader)
         
         model.eval()

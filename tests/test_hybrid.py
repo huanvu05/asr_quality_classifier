@@ -6,24 +6,9 @@ import numpy as np
 import pandas as pd
 import joblib
 
-# 1. Mock dependencies for local testing
-mock_modules = [
-    'librosa', 'xgboost', 'seaborn', 'matplotlib', 'matplotlib.pyplot', 'tqdm'
-]
-for mod in mock_modules:
-    sys.modules[mod] = MagicMock()
-
-# Setup explicit librosa mock returns
-import librosa
-librosa.load.return_value = (np.random.rand(16000), 16000)
-librosa.get_duration.return_value = 5.0
-librosa.effects.split.return_value = [[0, 8000], [10000, 15000]]
-librosa.feature.rms.return_value = np.array([[0.1, 0.5, 0.2, 0.05, 0.6]])
-librosa.feature.spectral_rolloff.return_value = np.array([[2000, 2500, 1500, 2200, 1800]])
-
-# 2. Fix TQDM for tests
-import tqdm
-tqdm.tqdm.side_effect = lambda x, **kwargs: x
+# Setup explicit librosa mock returns locally if needed, but since we don't mock sys.modules
+# we will just patch them where needed or let them run. Since this test uses dummy files
+# that are empty, librosa.load will fail. We need to patch librosa.load.
 
 # Add root path
 sys.path.append(os.getcwd())
@@ -58,7 +43,18 @@ open("data/test_audio/audio3.wav", "w").close()
 
 
 class TestHybridPipelineLogic(unittest.TestCase):
-    def test_feature_extraction_dims(self):
+    @patch('librosa.load')
+    @patch('librosa.get_duration')
+    @patch('librosa.effects.split')
+    @patch('librosa.feature.rms')
+    @patch('librosa.feature.spectral_rolloff')
+    def test_feature_extraction_dims(self, mock_rolloff, mock_rms, mock_split, mock_duration, mock_load):
+        mock_load.return_value = (np.random.rand(16000), 16000)
+        mock_duration.return_value = 5.0
+        mock_split.return_value = [[0, 8000], [10000, 15000]]
+        mock_rms.return_value = np.array([[0.1, 0.5, 0.2, 0.05, 0.6]])
+        mock_rolloff.return_value = np.array([[2000, 2500, 1500, 2200, 1800]])
+        
         """Test if Component A (512) + Component B (10) = 522 dimensions."""
         from train_hybrid import extract_handcrafted_features, build_hybrid_dataset
         

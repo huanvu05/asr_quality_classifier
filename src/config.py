@@ -17,23 +17,27 @@ class Config:
     MODELS_DIR: str = "models"
     CSV_PATH: str = "data/transcripts/training.csv"
     
-    # Audio & SOTA Encoder Settings
+    # --- ĐẠI TU KIẾN TRÚC ---
     SAMPLE_RATE: int = 16000
-    ENCODER_MODEL_NAME: str = "openai/whisper-base" 
-    CHUNK_DURATION_S: float = 2.0  # Chia khúc 2 giây
-    # Whisper-base có 512D. Chúng ta dùng Mean Pooling + Max Pooling = 1024D
-    EMBEDDING_DIM: int = 1024 
+    
+    # Đổi sang Wav2Vec2 (Bản Base 768 chiều để tối ưu tốc độ/bộ nhớ trên T4)
+    # Bản XLSR-53 1024D quá nặng có thể gây OOM trên Colab
+    ENCODER_MODEL_NAME: str = "facebook/wav2vec2-base" 
+    EMBEDDING_DIM: int = 768 
+    
+    # Chuẩn hóa độ dài Sequence cho Attention (Ví dụ: 300 frames ~ 6 giây)
+    MAX_SEQ_LENGTH: int = 400 
     
     # DNN Hyperparameters
     SEED: int = 42
-    TEST_SIZE: float = 0.2  # 80/20 Train-Val Split
-    BATCH_SIZE: int = 128   # Tăng Batch Size để vắt kiệt T4 x2
-    EPOCHS: int = 30        # Giảm Epoch vì model hội tụ quá nhanh
-    LEARNING_RATE: float = 2e-4
-    WEIGHT_DECAY: float = 5e-3 # Tăng gấp 10 lần Weight Decay (L2 penalty) để bóp nghẹt overfitting
+    TEST_SIZE: float = 0.2  
+    BATCH_SIZE: int = 32   # Giảm Batch Size xuống 32 vì Sequence 400x768 tốn nhiều RAM hơn
+    EPOCHS: int = 40       
+    LEARNING_RATE: float = 1e-4
+    WEIGHT_DECAY: float = 1e-3
     
     # Imbalance
-    POS_WEIGHT: float = 2.87 # ~2596/904
+    POS_WEIGHT: float = 2.87
     
     DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
 

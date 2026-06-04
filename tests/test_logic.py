@@ -4,18 +4,7 @@ import sys
 import os
 import numpy as np
 
-# 1. Create mocks for all heavy dependencies
-mock_modules = [
-    'librosa', 'transformers', 'jiwer', 'azure', 'azure.storage', 
-    'azure.storage.blob', 'lightgbm', 'xgboost', 'seaborn', 'matplotlib', 
-    'matplotlib.pyplot', 'soundfile', 'num2words', 'torch', 'pandas', 'sklearn', 
-    'sklearn.model_selection', 'sklearn.metrics', 'sklearn.preprocessing', 'joblib', 'tqdm'
-]
-
-for mod in mock_modules:
-    sys.modules[mod] = MagicMock()
-
-# 2. Import src modules AFTER mocking
+# 2. Import src modules
 sys.path.append(os.getcwd())
 from src.preprocessor import TextPreprocessor
 from src.evaluator import Evaluator
@@ -24,17 +13,14 @@ from src.config import config
 class TestASRQualityLogic(unittest.TestCase):
     def test_text_normalization(self):
         """Tests Vietnamese text cleaning and number conversion."""
-        # Manually mock num2words inside the test to be safe
-        with patch('num2words.num2words') as mock_n2w:
-            mock_n2w.side_effect = lambda x, lang: "một trăm hai mươi ba" if str(x) == "123" else str(x)
-            proc = TextPreprocessor()
-            test_cases = [
-                ("Chào 123", "chào một trăm hai mươi ba"),
-                ("Test... câu! hỏi?", "test câu hỏi"),
-                ("  Nhiều   khoảng  trống  ", "nhiều khoảng trống")
-            ]
-            for input_text, expected in test_cases:
-                self.assertEqual(proc.clean_text(input_text), expected)
+        proc = TextPreprocessor()
+        test_cases = [
+            ("Chào 123", "chào một trăm hai mươi ba"),
+            ("Test... câu! hỏi?", "test câu hỏi"),
+            ("  Nhiều   khoảng  trống  ", "nhiều khoảng trống")
+        ]
+        for input_text, expected in test_cases:
+            self.assertEqual(proc.clean_text(input_text), expected)
 
     def test_threshold_optimization(self):
         """Tests if the threshold optimizer finds the best F1."""

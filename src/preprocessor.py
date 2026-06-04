@@ -18,8 +18,11 @@ class TextPreprocessor:
         """
         def replace_num(match):
             try:
-                return num2words(match.group(), lang='vi')
-            except:
+                # Convert string to int before passing to num2words
+                num_str = match.group()
+                return num2words(int(num_str), lang='vi')
+            except Exception as e:
+                print(f"Error in num2words: {e}")
                 return match.group()
         
         return re.sub(r'\d+', replace_num, text)

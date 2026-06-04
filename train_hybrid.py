@@ -106,7 +106,7 @@ def extract_handcrafted_features(audio_path: str, sr: int = 16000) -> np.ndarray
         return features
 
     except Exception as e:
-        # print(f"Error reading {audio_path}: {e}")
+        print(f"Error reading {audio_path}: {e}")
         return np.zeros(10)
 
 # ==========================================

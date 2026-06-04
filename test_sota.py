@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 from src.config import config
-from src.features import DeepAudioExtractorSOTA
+from src.features import DeepAudioSequenceExtractor
 from src.model import AttentionHeadClassifier
 
 def load_sota_model(model_path: str):
@@ -16,7 +16,7 @@ def load_sota_model(model_path: str):
     model = AttentionHeadClassifier().to(config.DEVICE)
     
     # Handle DataParallel state dict if it was saved with multiple GPUs
-    state_dict = torch.load(model_path, map_location=config.DEVICE)
+    state_dict = torch.load(model_path, map_location=config.DEVICE, weights_only=True)
     new_state_dict = {}
     for k, v in state_dict.items():
         name = k.replace("module.", "") if k.startswith("module.") else k
@@ -31,7 +31,7 @@ def evaluate_on_test_set(test_csv_path: str, model_path: str, threshold: float):
     df_test = pd.read_csv(test_csv_path)
     
     # 1. Check if we need to extract embeddings
-    extractor = DeepAudioExtractorSOTA()
+    extractor = DeepAudioSequenceExtractor()
     
     y_true = []
     y_probs = []

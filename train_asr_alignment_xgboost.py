@@ -124,61 +124,90 @@ def run_phase_1_asr_extraction(csv_path: str, audio_root: str):
                 if f.endswith('.wav'):
                     file_path_map[f] = os.path.join(root, f)
 
-    print(f"[*] Tải mô hình ASR: {Config.ASR_MODEL}...")
-    asr_pipe = pipeline(
-        "automatic-speech-recognition", 
-        model=Config.ASR_MODEL, 
-        device=DEVICE,
-        chunk_length_s=30, # Cắt chunk cho audio dài
-    )
+    from concurrent.futures import ThreadPoolExecutor
 
+    # Lọc dữ liệu hợp lệ
+    valid_data = []
+    for idx, row in df.iterrows():
+        fname = str(row['file_name'])
+        if fname in file_path_map:
+            valid_data.append((row, file_path_map[fname]))
+
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if num_gpus > 1:
+        print(f"[*] Kích hoạt giải mã ASR song song trên {num_gpus} GPUs!")
+        pipelines = []
+        for i in range(num_gpus):
+            pipelines.append(pipeline(
+                "automatic-speech-recognition", 
+                model=Config.ASR_MODEL, 
+                device=f"cuda:{i}",
+                chunk_length_s=30,
+            ))
+    else:
+        print(f"[*] Tải mô hình ASR: {Config.ASR_MODEL} trên {DEVICE}...")
+        pipelines = [pipeline(
+            "automatic-speech-recognition", 
+            model=Config.ASR_MODEL, 
+            device=DEVICE,
+            chunk_length_s=30,
+        )]
+
+    # Hàm xử lý một phần dữ liệu cho từng GPU
+    def process_chunk(chunk_data, pipe):
+        chunk_results = []
+        # Chạy pipeline qua một list các đường dẫn để tận dụng batch_size
+        audio_paths = [abs_path for _, abs_path in chunk_data]
+        
+        # Pipeline generator
+        dataset_out = pipe(audio_paths, batch_size=8)
+        
+        for (row, abs_path), out in zip(chunk_data, dataset_out):
+            ground_truth = clean_text(row['transcript'])
+            predicted_text = ""
+            duration, snr, silence_ratio = 0.0, 0.0, 1.0
+            wer_score, cer_score = 1.0, 1.0
+            
+            try:
+                predicted_text = clean_text(out["text"])
+                
+                if len(ground_truth) > 0 and len(predicted_text) > 0:
+                    wer_score = jiwer.wer(ground_truth, predicted_text)
+                    cer_score = jiwer.cer(ground_truth, predicted_text)
+                elif len(ground_truth) == 0 and len(predicted_text) == 0:
+                    wer_score, cer_score = 0.0, 0.0
+                     
+                y, sr = librosa.load(abs_path, sr=Config.SAMPLE_RATE, mono=True)
+                duration, snr, silence_ratio = extract_physical_features(y, sr)
+            except Exception as e:
+                pass
+                
+            row_res = row.to_dict()
+            row_res['predicted_text'] = predicted_text
+            row_res['clean_transcript'] = ground_truth
+            row_res['wer_score'] = wer_score
+            row_res['cer_score'] = cer_score
+            row_res['audio_duration'] = duration
+            row_res['snr_estimate'] = snr
+            row_res['silence_ratio'] = silence_ratio
+            
+            chunk_results.append(row_res)
+            
+        return chunk_results
+
+    print("[*] Bắt đầu giải mã ASR và tính toán Đặc trưng...")
     results = []
     
-    print("[*] Bắt đầu giải mã ASR và tính toán Đặc trưng...")
-    # Tối ưu: gom path vào list để xử lý (Dùng Dataset/KeyDataset nếu muốn chạy Pipeline batching, nhưng để an toàn catch lỗi, ta chạy for loop có try-except)
-    for idx, row in tqdm(df.iterrows(), total=len(df)):
-        fname = str(row['file_name'])
-        if fname not in file_path_map:
-            continue
-            
-        abs_path = file_path_map[fname]
-        ground_truth = clean_text(row['transcript'])
+    # Chia dữ liệu cho các GPU
+    chunk_size = int(np.ceil(len(valid_data) / len(pipelines)))
+    chunks = [valid_data[i:i + chunk_size] for i in range(0, len(valid_data), chunk_size)]
+    
+    with ThreadPoolExecutor(max_workers=len(pipelines)) as executor:
+        futures = [executor.submit(process_chunk, chunk, pipelines[i]) for i, chunk in enumerate(chunks)]
         
-        predicted_text = ""
-        duration, snr, silence_ratio = 0.0, 0.0, 1.0
-        wer_score, cer_score = 1.0, 1.0
-        
-        try:
-            # 1. Giải mã Text bằng ASR
-            out = asr_pipe(abs_path)
-            predicted_text = clean_text(out["text"])
-            
-            # 2. Tính toán Lỗi
-            if len(ground_truth) > 0 and len(predicted_text) > 0:
-                wer_score = jiwer.wer(ground_truth, predicted_text)
-                cer_score = jiwer.cer(ground_truth, predicted_text)
-            elif len(ground_truth) == 0 and len(predicted_text) == 0:
-                 wer_score, cer_score = 0.0, 0.0 # Đều rỗng -> Không có lỗi
-                 
-            # 3. Trích xuất đặc trưng vật lý
-            y, sr = librosa.load(abs_path, sr=Config.SAMPLE_RATE, mono=True)
-            duration, snr, silence_ratio = extract_physical_features(y, sr)
-            
-        except Exception as e:
-            # Lỗi đọc file, hoặc ASR fail
-            pass
-            
-        # Ghi nhận kết quả
-        row_res = row.to_dict()
-        row_res['predicted_text'] = predicted_text
-        row_res['clean_transcript'] = ground_truth
-        row_res['wer_score'] = wer_score
-        row_res['cer_score'] = cer_score
-        row_res['audio_duration'] = duration
-        row_res['snr_estimate'] = snr
-        row_res['silence_ratio'] = silence_ratio
-        
-        results.append(row_res)
+        # Có thể dùng một progress bar chung nếu cần, nhưng để đơn giản ta hiển thị tiến trình hoàn thành của các chunk lớn
+        for future in tqdm(futures, total=len(futures), desc="Processing GPU Chunks"):
+            results.extend(future.result())
 
     results_df = pd.DataFrame(results)
     results_df.to_csv(Config.INTERMEDIATE_CSV, index=False)

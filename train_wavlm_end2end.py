@@ -347,6 +347,7 @@ def train_and_evaluate(valid_df: pd.DataFrame):
                 probs = torch.sigmoid(logits).cpu().numpy()
                 fold_probs.extend(probs)
                 
+        y_val = val_df['target'].values
         oof_probs[val_idx] = fold_probs
         oof_targets[val_idx] = y_val
         

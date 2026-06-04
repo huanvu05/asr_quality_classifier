@@ -68,16 +68,25 @@ class Evaluator:
         plt.savefig('confusion_matrix.png')
         plt.close()
 
-    def train_model(self, model, train_loader, val_loader):
+    def train_model(self, model, train_loader, val_loader, fold_idx=None):
+        # Tận dụng tối đa Multi-GPU (T4 x2)
+        if torch.cuda.device_count() > 1 and self.device == "cuda":
+            print(f"🚀 Kích hoạt chạy song song trên {torch.cuda.device_count()} GPUs!")
+            model = nn.DataParallel(model)
+
         # Use Focal Loss instead of standard BCE
         criterion = FocalLossWithLogits(alpha=config.POS_WEIGHT, gamma=2.0)
         optimizer = torch.optim.AdamW(model.parameters(), lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
         
         best_val_loss = float('inf')
         best_model_state = None
-        patience, max_patience = 0, 8
         
+        # Tên file checkpoint để lưu vật lý xuống ổ cứng
+        checkpoint_name = f"best_model_fold_{fold_idx}.pth" if fold_idx is not None else "best_model_final.pth"
+        checkpoint_path = os.path.join(config.MODELS_DIR, checkpoint_name)
+        
+        print("\n--- Bắt đầu quá trình huấn luyện DNN ---")
         for epoch in range(config.EPOCHS):
             model.train()
             train_loss = 0
@@ -91,6 +100,8 @@ class Evaluator:
                 optimizer.step()
                 
                 train_loss += loss.item()
+            
+            train_loss /= len(train_loader)
                 
             model.eval()
             val_loss = 0
@@ -103,16 +114,27 @@ class Evaluator:
             val_loss /= len(val_loader)
             scheduler.step(val_loss)
             
+            # Liên tục lưu model tốt nhất vật lý xuống ổ cứng
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 best_model_state = copy.deepcopy(model.state_dict())
-                patience = 0
+                
+                # Lưu file .pth xuống disk ngay lập tức
+                # Xử lý trường hợp dùng DataParallel
+                model_to_save = model.module if isinstance(model, nn.DataParallel) else model
+                torch.save(model_to_save.state_dict(), checkpoint_path)
+                
+                print(f"Epoch {epoch+1:03d}/{config.EPOCHS} | Train Loss: {train_loss:.5f} | Val Loss: {val_loss:.5f} 🌟 (Lưu Checkpoint: {checkpoint_name})")
             else:
-                patience += 1
-                if patience >= max_patience:
-                    break
+                # In log thường nếu không phải epoch tốt nhất
+                if (epoch + 1) % 5 == 0 or epoch == 0:
+                    print(f"Epoch {epoch+1:03d}/{config.EPOCHS} | Train Loss: {train_loss:.5f} | Val Loss: {val_loss:.5f}")
                     
-        model.load_state_dict(best_model_state)
+        # Load lại trọng số tốt nhất sau khi kết thúc tất cả epochs từ file vật lý cho chắc chắn
+        if os.path.exists(checkpoint_path):
+             model_to_load = model.module if isinstance(model, nn.DataParallel) else model
+             model_to_load.load_state_dict(torch.load(checkpoint_path))
+             
         return model
 
     def run_cv(self, embeddings: np.ndarray, labels: np.ndarray):
@@ -129,7 +151,7 @@ class Evaluator:
             val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, shuffle=False)
             
             model = AttentionHeadClassifier().to(self.device)
-            model = self.train_model(model, train_loader, val_loader)
+            model = self.train_model(model, train_loader, val_loader, fold_idx=fold+1)
             
             model.eval()
             val_probs = []

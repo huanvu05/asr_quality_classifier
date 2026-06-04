@@ -26,9 +26,9 @@ class Config:
     # DNN Hyperparameters
     SEED: int = 42
     N_FOLDS: int = 5
-    BATCH_SIZE: int = 32
-    EPOCHS: int = 60
-    LEARNING_RATE: float = 5e-5
+    BATCH_SIZE: int = 64
+    EPOCHS: int = 150
+    LEARNING_RATE: float = 1e-4
     WEIGHT_DECAY: float = 1e-4
     
     # Imbalance

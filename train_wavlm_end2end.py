@@ -256,7 +256,7 @@ def train_and_evaluate(valid_df: pd.DataFrame):
         train_dataset = WavLMAudioDataset(train_df, feature_extractor)
         val_dataset = WavLMAudioDataset(val_df, feature_extractor)
         
-        train_loader = DataLoader(train_dataset, batch_size=Config.BATCH_SIZE, shuffle=True, collate_fn=collate_wrapper, num_workers=0)
+        train_loader = DataLoader(train_dataset, batch_size=Config.BATCH_SIZE, shuffle=True, collate_fn=collate_wrapper, num_workers=0, drop_last=True)
         val_loader = DataLoader(val_dataset, batch_size=Config.BATCH_SIZE, shuffle=False, collate_fn=collate_wrapper, num_workers=0)
         
         model = WavLMClassifier().to(Config.DEVICE)

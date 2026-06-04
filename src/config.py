@@ -19,23 +19,22 @@ class Config:
     
     # Audio & SOTA Encoder Settings
     SAMPLE_RATE: int = 16000
-    ENCODER_MODEL_NAME: str = "facebook/wav2vec2-large-xlsr-53"  # SOTA for Acoustic Representations
-    EMBEDDING_DIM: int = 1024  # Của bản Large
-    MAX_SEQ_LENGTH: int = 300  # Trimming/Padding sequence length for Attention
+    ENCODER_MODEL_NAME: str = "openai/whisper-base" 
+    CHUNK_DURATION_S: float = 2.0  # Chia khúc 2 giây
+    # Whisper-base có 512D. Chúng ta dùng Mean Pooling + Max Pooling = 1024D
+    EMBEDDING_DIM: int = 1024 
     
     # DNN Hyperparameters
     SEED: int = 42
-    N_FOLDS: int = 5
-    BATCH_SIZE: int = 64
-    EPOCHS: int = 150
-    LEARNING_RATE: float = 3e-4 # Tăng mạnh LR từ 1e-4 lên 3e-4
-    WEIGHT_DECAY: float = 1e-4
+    TEST_SIZE: float = 0.2  # 80/20 Train-Val Split
+    BATCH_SIZE: int = 128   # Tăng Batch Size để vắt kiệt T4 x2
+    EPOCHS: int = 50        # Như user yêu cầu
+    LEARNING_RATE: float = 2e-4
+    WEIGHT_DECAY: float = 5e-4
     
     # Imbalance
-    POS_WEIGHT: float = 900 / 2600.0  
+    POS_WEIGHT: float = 2.87 # ~2596/904
     
-    # Cho phép sử dụng lại GPU. 
-    # Bắt buộc người dùng phải chọn T4 GPU trên Kaggle.
     DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
 
     def __post_init__(self):

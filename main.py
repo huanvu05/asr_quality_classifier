@@ -7,10 +7,8 @@ import torch
 import joblib
 from src.config import config
 from src.data_loader import load_labels
-from src.features import DeepAudioExtractorSOTA
-from src.model import AttentionHeadClassifier, SequenceAudioDataset
+from src.features import DeepAudioChunkExtractor
 from src.evaluator import Evaluator
-from torch.utils.data import DataLoader
 import json
 
 def create_metadata(run_id: str, metrics: dict, params: dict):
@@ -19,7 +17,7 @@ def create_metadata(run_id: str, metrics: dict, params: dict):
         "timestamp": datetime.datetime.now().isoformat(),
         "metrics": metrics,
         "params": params,
-        "architecture": "Wav2Vec2_SOTA_Attention"
+        "architecture": "WhisperChunk_MeanMax_DNN"
     }
     meta_path = os.path.join(config.MODELS_DIR, f"{run_id}_metadata.json")
     with open(meta_path, "w") as f:
@@ -28,20 +26,20 @@ def create_metadata(run_id: str, metrics: dict, params: dict):
 
 def main(args):
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_id = f"run_{timestamp}_sota_attention"
-    print(f"Starting SOTA Pipeline: {run_id}")
+    run_id = f"run_{timestamp}_chunk_dnn"
+    print(f"Starting Chunk & Pool Pipeline: {run_id}")
 
     # 1. Load Labels
     labels_df = load_labels(args.labels_path)
 
-    # 2. Extract SOTA Sequence Embeddings
+    # 2. Extract Features (Chunking + Pooling)
     features_path = os.path.join(config.DATA_DIR, f"{run_id}_embeddings.pkl")
     
     if not args.skip_extraction:
-        extractor = DeepAudioExtractorSOTA()
+        extractor = DeepAudioChunkExtractor()
         data = extractor.process_dataset(labels_df, features_path)
     else:
-        print(f"Loading precomputed sequence embeddings from {args.features_path}")
+        print(f"Loading precomputed chunked embeddings from {args.features_path}")
         data = joblib.load(args.features_path)
 
     if not data:
@@ -54,9 +52,9 @@ def main(args):
     
     for item in data:
         emb = item['embedding']
-        # Sanity check: Ensure embedding is 2D [seq_length, dim]
-        if len(emb.shape) != 2:
-            print(f"Skipping bad embedding shape: {emb.shape}")
+        # Check if shape is exactly 1024 (512 Mean + 512 Max)
+        if emb.shape[0] != config.EMBEDDING_DIM:
+            print(f"Warning: Unexpected shape {emb.shape} for {item['file_name']}. Skipping.")
             continue
             
         label = 1 if str(item['label']) == '1' else 0
@@ -66,29 +64,18 @@ def main(args):
     X = np.array(embeddings)
     y = np.array(labels)
 
-    # 4. Training & Cross-Validation
-    print("Starting SOTA PyTorch Training (Attention + Focal Loss)...")
-    evaluator = Evaluator(n_folds=config.N_FOLDS)
-    oof_probs = evaluator.run_cv(X, y)
+    # 4. Training (Single Fold)
+    print("\nStarting PyTorch DNN Training (80/20 Split)...")
+    evaluator = Evaluator()
+    y_val, val_probs = evaluator.run_training(X, y)
 
-    # 5. Threshold Optimization
-    optimal_threshold = evaluator.optimize_threshold(y, oof_probs)
-    evaluator.evaluate_oof(y, oof_probs, optimal_threshold)
+    # 5. Threshold Optimization on Validation Set
+    optimal_threshold = evaluator.optimize_threshold(y_val, val_probs)
+    evaluator.evaluate_results(y_val, val_probs, optimal_threshold)
 
-    # 6. Train Final Model on Full Dataset
-    print("Training final model on full dataset...")
-    full_dataset = SequenceAudioDataset(X, y)
-    full_loader = DataLoader(full_dataset, batch_size=config.BATCH_SIZE, shuffle=True)
-    
-    final_model = AttentionHeadClassifier().to(config.DEVICE)
-    final_model = evaluator.train_model(final_model, full_loader, full_loader)
-    
-    # 7. Save Artifacts
-    model_path = os.path.join(config.MODELS_DIR, f"{run_id}_model.pth")
-    torch.save(final_model.state_dict(), model_path)
-    
+    # 6. Save Metadata
     metrics = {
-        "oof_macro_f1": evaluator.optimize_threshold(y, oof_probs), 
+        "val_macro_f1": evaluator.optimize_threshold(y_val, val_probs),
         "optimal_threshold": optimal_threshold
     }
     
@@ -98,19 +85,16 @@ def main(args):
         "batch_size": config.BATCH_SIZE,
         "lr": config.LEARNING_RATE,
         "pos_weight": config.POS_WEIGHT,
-        "max_seq_len": config.MAX_SEQ_LENGTH
+        "chunk_duration": config.CHUNK_DURATION_S
     }
     meta_path = create_metadata(run_id, metrics, params)
 
-    print(f"\n[DONE] Artifacts saved locally in {config.MODELS_DIR}:")
-    print(f"- PyTorch Model: {model_path}")
-    print(f"- Metadata: {meta_path}")
-    print(f"- Confusion Matrix: confusion_matrix.png")
+    print(f"\n[DONE] Pipeline completed. Run ID: {run_id}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--labels-path", type=str, default="data/transcripts/training.csv")
-    parser.add_argument("--skip-extraction", action="store_true", help="Skip Wav2Vec2 extraction if embeddings already exist")
-    parser.add_argument("--features-path", type=str, help="Path to precomputed .pkl file if skipping extraction")
+    parser.add_argument("--labels-path", type=str, default=config.CSV_PATH)
+    parser.add_argument("--skip-extraction", action="store_true", help="Skip extraction if embeddings exist")
+    parser.add_argument("--features-path", type=str, help="Path to precomputed .pkl file")
     args = parser.parse_args()
     main(args)

@@ -24,18 +24,20 @@ class AudioDNN(nn.Module):
     def __init__(self, input_dim: int = config.EMBEDDING_DIM):
         super(AudioDNN, self).__init__()
         
+        # Reduced complexity to prevent severe overfitting.
+        # Increased Dropout to 0.5
         self.network = nn.Sequential(
-            nn.Linear(input_dim, 512),
-            nn.BatchNorm1d(512),
+            nn.Linear(input_dim, 256),
+            nn.BatchNorm1d(256),
             nn.ReLU(),
-            nn.Dropout(0.3), # Dropout as requested
+            nn.Dropout(0.5), 
             
-            nn.Linear(512, 128),
-            nn.BatchNorm1d(128),
+            nn.Linear(256, 64),
+            nn.BatchNorm1d(64),
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.5),
             
-            nn.Linear(128, 1) # Raw logit output
+            nn.Linear(64, 1) 
         )
 
     def forward(self, x):

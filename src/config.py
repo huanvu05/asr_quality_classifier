@@ -28,9 +28,9 @@ class Config:
     SEED: int = 42
     TEST_SIZE: float = 0.2  # 80/20 Train-Val Split
     BATCH_SIZE: int = 128   # Tăng Batch Size để vắt kiệt T4 x2
-    EPOCHS: int = 50        # Như user yêu cầu
+    EPOCHS: int = 30        # Giảm Epoch vì model hội tụ quá nhanh
     LEARNING_RATE: float = 2e-4
-    WEIGHT_DECAY: float = 5e-4
+    WEIGHT_DECAY: float = 5e-3 # Tăng gấp 10 lần Weight Decay (L2 penalty) để bóp nghẹt overfitting
     
     # Imbalance
     POS_WEIGHT: float = 2.87 # ~2596/904

@@ -75,10 +75,11 @@ class Evaluator:
             print(f"🚀 Kích hoạt chạy song song trên {torch.cuda.device_count()} GPUs!")
             model = nn.DataParallel(model)
 
-        # Use Focal Loss instead of standard BCE
-        criterion = FocalLossWithLogits(alpha=config.POS_WEIGHT, gamma=2.0)
+        # Use Focal Loss instead of standard BCE. Giảm gamma xuống 1.0 để gradients mượt hơn ở giai đoạn đầu
+        criterion = FocalLossWithLogits(alpha=config.POS_WEIGHT, gamma=1.0)
         optimizer = torch.optim.AdamW(model.parameters(), lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+        # Nới lỏng patience để Learning Rate không bị ép giảm quá sớm
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
         
         best_val_loss = float('inf')
         best_model_state = None

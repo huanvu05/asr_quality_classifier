@@ -28,7 +28,7 @@ class Config:
     N_FOLDS: int = 5
     BATCH_SIZE: int = 64
     EPOCHS: int = 150
-    LEARNING_RATE: float = 1e-4
+    LEARNING_RATE: float = 3e-4 # Tăng mạnh LR từ 1e-4 lên 3e-4
     WEIGHT_DECAY: float = 1e-4
     
     # Imbalance

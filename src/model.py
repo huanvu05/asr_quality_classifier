@@ -37,7 +37,7 @@ class AttentionHeadClassifier(nn.Module):
             nn.Linear(hidden_dim * 2, 128),
             nn.BatchNorm1d(128),
             nn.ReLU(),
-            nn.Dropout(0.5),
+            nn.Dropout(0.3), # Giảm từ 0.5 xuống 0.3 để học nhanh hơn
             nn.Linear(128, 1) # Raw logit output
         )
 

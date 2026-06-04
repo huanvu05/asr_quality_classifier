@@ -13,7 +13,7 @@ import seaborn as sns
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from transformers import WavLMModel, Wav2Vec2FeatureExtractor
+from transformers import WavLMModel, Wav2Vec2FeatureExtractor, get_cosine_schedule_with_warmup
 
 from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.metrics import classification_report, confusion_matrix, f1_score, roc_auc_score
@@ -40,7 +40,9 @@ class Config:
     BATCH_SIZE = 4
     ACCUMULATION_STEPS = 4
     EPOCHS = 10
-    LR = 2e-5
+    LR_HEAD = 1e-4
+    LR_BACKBONE = 2e-5
+    WEIGHT_DECAY = 1e-2
     NUM_FOLDS = 5
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     SEED = 42
@@ -193,21 +195,38 @@ def collate_fn_wavlm(batch, feature_extractor):
     return inputs.input_values, targets, weights
 
 # ==========================================
-# 4. KIẾN TRÚC MÔ HÌNH (WAVLM + CLASSIFICATION HEAD)
+# 4. KIẾN TRÚC MÔ HÌNH V2 (ANTI-FORGETTING)
 # ==========================================
-class WavLMClassifier(nn.Module):
+class RobustWavLMClassifier(nn.Module):
     def __init__(self):
-        super(WavLMClassifier, self).__init__()
+        super(RobustWavLMClassifier, self).__init__()
         print(f"[*] Khởi tạo mô hình WavLM: {Config.MODEL_NAME}")
         self.wavlm = WavLMModel.from_pretrained(Config.MODEL_NAME)
         
-        # Classification Head
+        # --- ĐÓNG BĂNG PHÂN TẦNG (GRADUAL UNFREEZING) ---
+        print("[*] Áp dụng đóng băng phân tầng (Feature Extractor + Layer 0-7)...")
+        # 1. Đóng băng Feature Extractor (CNN)
+        for param in self.wavlm.feature_extractor.parameters():
+            param.requires_grad = False
+            
+        # 2. Đóng băng Feature Projection
+        for param in self.wavlm.feature_projection.parameters():
+            param.requires_grad = False
+            
+        # 3. Đóng băng 8 lớp Transformer đầu tiên (0 đến 7)
+        for i in range(8):
+            for param in self.wavlm.encoder.layers[i].parameters():
+                param.requires_grad = False
+                
+        # Các lớp 8, 9, 10, 11 tự động được giữ requires_grad=True
+        
+        # --- CLASSIFICATION HEAD (1536 -> 512 -> 1) ---
         self.head = nn.Sequential(
-            nn.Linear(768, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
+            nn.Linear(1536, 512),
+            nn.BatchNorm1d(512),
+            nn.GELU(),
             nn.Dropout(0.4),
-            nn.Linear(256, 1) # Raw logit
+            nn.Linear(512, 1) # Raw logit output
         )
         
     def forward(self, input_values):
@@ -215,13 +234,20 @@ class WavLMClassifier(nn.Module):
         outputs = self.wavlm(input_values)
         
         # WavLM trả về last_hidden_state có shape: (Batch, Frames, 768)
-        hidden_states = outputs.last_hidden_state
+        last_hidden_state = outputs.last_hidden_state
         
-        # Mean Pooling dọc theo trục thời gian (Time dimension = 1) -> (Batch, 768)
-        pooled_output = torch.mean(hidden_states, dim=1)
+        # --- CƠ CHẾ POOLING LAI (HYBRID STATISTICAL POOLING) ---
+        # 1. Mean Pooling dọc theo trục thời gian
+        mean_pool = torch.mean(last_hidden_state, dim=1) # (Batch, 768)
+        
+        # 2. Max Pooling dọc theo trục thời gian
+        max_pool = torch.max(last_hidden_state, dim=1)[0] # (Batch, 768)
+        
+        # 3. Ghép nối (Concatenate)
+        concat_pool = torch.cat((mean_pool, max_pool), dim=1) # (Batch, 1536)
         
         # Đưa qua Classification Head -> (Batch, 1)
-        logits = self.head(pooled_output)
+        logits = self.head(concat_pool)
         
         return logits.squeeze(-1) # -> (Batch)
 
@@ -259,7 +285,7 @@ def train_and_evaluate(valid_df: pd.DataFrame):
         train_loader = DataLoader(train_dataset, batch_size=Config.BATCH_SIZE, shuffle=True, collate_fn=collate_wrapper, num_workers=0, drop_last=True)
         val_loader = DataLoader(val_dataset, batch_size=Config.BATCH_SIZE, shuffle=False, collate_fn=collate_wrapper, num_workers=0)
         
-        model = WavLMClassifier().to(Config.DEVICE)
+        model = RobustWavLMClassifier().to(Config.DEVICE)
         if torch.cuda.device_count() > 1 and Config.DEVICE == "cuda":
              print(f"🚀 Kích hoạt DataParallel trên {torch.cuda.device_count()} GPUs!")
              model = nn.DataParallel(model)
@@ -267,8 +293,21 @@ def train_and_evaluate(valid_df: pd.DataFrame):
         # Custom Loss với Data-Centric Penalty
         criterion = nn.BCEWithLogitsLoss(reduction='none')
         
-        optimizer = torch.optim.AdamW(model.parameters(), lr=Config.LR, weight_decay=1e-3)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2)
+        # --- THIẾT LẬP OPTIMIZER VỚI LR PHÂN TẦNG ---
+        base_model = model.module if isinstance(model, nn.DataParallel) else model
+        
+        head_params = list(base_model.head.parameters())
+        wavlm_params = [p for p in base_model.wavlm.parameters() if p.requires_grad]
+        
+        optimizer = torch.optim.AdamW([
+            {'params': wavlm_params, 'lr': Config.LR_BACKBONE},
+            {'params': head_params, 'lr': Config.LR_HEAD}
+        ], weight_decay=Config.WEIGHT_DECAY)
+        
+        # --- THIẾT LẬP SCHEDULER (COSINE WARMUP) ---
+        total_steps = len(train_loader) // Config.ACCUMULATION_STEPS * Config.EPOCHS
+        warmup_steps = int(0.1 * total_steps)
+        scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
         
         best_val_f1 = 0.0
         best_model_path = os.path.join(Config.MODELS_DIR, f"best_wavlm_fold_{fold+1}.pth")
@@ -293,6 +332,7 @@ def train_and_evaluate(valid_df: pd.DataFrame):
                 
                 if (step + 1) % Config.ACCUMULATION_STEPS == 0 or (step + 1) == len(train_loader):
                     optimizer.step()
+                    scheduler.step()
                     optimizer.zero_grad()
                     
                 train_loss += weighted_loss.item() * Config.ACCUMULATION_STEPS
@@ -322,8 +362,6 @@ def train_and_evaluate(valid_df: pd.DataFrame):
             
             print(f"Epoch {epoch+1}/{Config.EPOCHS} | Train Loss: {train_loss:.4f} | Val Macro F1 (Thresh=0.5): {val_f1:.4f}")
             
-            scheduler.step(val_f1)
-            
             if val_f1 > best_val_f1:
                 best_val_f1 = val_f1
                 model_to_save = model.module if isinstance(model, nn.DataParallel) else model
@@ -333,7 +371,7 @@ def train_and_evaluate(valid_df: pd.DataFrame):
         # --- Lưu kết quả OOF của Fold này ---
         print(f"\n[*] Đang đánh giá OOF cho Fold {fold+1} bằng mô hình tốt nhất...")
         # Load best model to predict OOF
-        best_model = WavLMClassifier().to(Config.DEVICE)
+        best_model = RobustWavLMClassifier().to(Config.DEVICE)
         best_model.load_state_dict(torch.load(best_model_path, map_location=Config.DEVICE))
         if torch.cuda.device_count() > 1 and Config.DEVICE == "cuda":
             best_model = nn.DataParallel(best_model)
@@ -391,10 +429,21 @@ def train_and_evaluate(valid_df: pd.DataFrame):
     overall_auc = roc_auc_score(final_y_true, final_y_probs)
     print(f"ROC-AUC: {overall_auc:.4f}")
     
+    # Export Confusion Matrix
+    cm = confusion_matrix(final_y_true, y_pred_final)
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=['Unusable(0)', 'Usable(1)'], yticklabels=['Unusable(0)', 'Usable(1)'])
+    plt.xlabel('Dự đoán (Predicted)')
+    plt.ylabel('Thực tế (Actual)')
+    plt.title(f'OOF Confusion Matrix (Threshold = {optimal_threshold:.2f})')
+    cm_path = os.path.join(Config.MODELS_DIR, "confusion_matrix.png")
+    plt.savefig(cm_path)
+    plt.close()
+
     # Export Metadata
     metadata = {
         "timestamp": datetime.datetime.now().isoformat(),
-        "architecture": f"End-to-End {Config.MODEL_NAME}",
+        "architecture": f"End-to-End {Config.MODEL_NAME} (Anti-Forgetting)",
         "metrics": {
             "oof_macro_f1": float(best_f1_overall),
             "oof_roc_auc": float(overall_auc),

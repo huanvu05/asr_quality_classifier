@@ -268,7 +268,7 @@ def train_and_evaluate(valid_df: pd.DataFrame):
         criterion = nn.BCEWithLogitsLoss(reduction='none')
         
         optimizer = torch.optim.AdamW(model.parameters(), lr=Config.LR, weight_decay=1e-3)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2, verbose=True)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2)
         
         best_val_f1 = 0.0
         best_model_path = os.path.join(Config.MODELS_DIR, f"best_wavlm_fold_{fold+1}.pth")

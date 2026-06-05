@@ -157,7 +157,8 @@ class DeepFusionDataset(Dataset):
         self.physical_features = []
         self.audios = []
         
-        for idx, row in tqdm(self.df.iterrows(), total=len(self.df)):
+        # Chỉ hiển thị progress bar, không in ra từng dòng
+        for idx, row in tqdm(self.df.iterrows(), total=len(self.df), mininterval=2.0):
             try:
                 y, sr = librosa.load(row['abs_path'], sr=Config.SAMPLE_RATE, mono=True)
                 phys_feat = extract_handcrafted_features(y, sr)
@@ -392,6 +393,7 @@ def train_fusion_model(valid_df: pd.DataFrame):
                 probs = torch.sigmoid(logits).cpu().numpy()
                 fold_probs.extend(probs)
                 
+        y_val = val_df['target'].values
         oof_probs[val_idx] = fold_probs
         oof_targets[val_idx] = y_val
         

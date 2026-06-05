@@ -39,7 +39,7 @@ class Config:
     MAX_DURATION_SEC = 5.0
     MAX_SAMPLES = int(SAMPLE_RATE * MAX_DURATION_SEC)
     
-    BATCH_SIZE = 8 # Có thể chạy batch lớn hơn vì chúng ta đóng băng WavLM làm feature extractor
+    BATCH_SIZE = 64  # Mỗi card T4 sẽ gánh 32 samples.
     EPOCHS = 15
     LR = 5e-4
     WEIGHT_DECAY = 1e-2
@@ -158,7 +158,7 @@ class DeepFusionDataset(Dataset):
         self.audios = []
         
         # Chỉ hiển thị progress bar, không in ra từng dòng
-        for idx, row in tqdm(self.df.iterrows(), total=len(self.df), mininterval=2.0):
+        for idx, row in tqdm(self.df.iterrows(), total=len(self.df), mininterval=5.0):
             try:
                 y, sr = librosa.load(row['abs_path'], sr=Config.SAMPLE_RATE, mono=True)
                 phys_feat = extract_handcrafted_features(y, sr)
@@ -267,7 +267,6 @@ class DeepAudioFusionNetwork(nn.Module):
     def forward(self, input_values, phys_feats):
         with torch.no_grad(): # Đảm bảo hoàn toàn không flow gradient ngược về WavLM
             outputs = self.wavlm(input_values)
-            # Lấy Hidden State từ Layer số 6 (index 6 của tuple hidden_states)
             # Tuple có 13 phần tử: 0 là embedding layer, 1->12 là các transformer layer
             latent_representation = outputs.hidden_states[Config.TARGET_LAYER] 
         
@@ -310,13 +309,32 @@ def train_fusion_model(valid_df: pd.DataFrame):
         val_df = valid_df.iloc[val_idx]
         
         train_dataset = DeepFusionDataset(train_df, feature_extractor, is_train=True)
-        # Tái sử dụng scaler của train cho val
         val_dataset = DeepFusionDataset(val_df, feature_extractor, scaler=train_dataset.scaler, is_train=False)
         
-        train_loader = DataLoader(train_dataset, batch_size=Config.BATCH_SIZE, shuffle=True, collate_fn=collate_wrapper, num_workers=0)
-        val_loader = DataLoader(val_dataset, batch_size=Config.BATCH_SIZE, shuffle=False, collate_fn=collate_wrapper, num_workers=0)
+        train_loader = DataLoader(
+            train_dataset, 
+            batch_size=Config.BATCH_SIZE, 
+            shuffle=True, 
+            collate_fn=collate_wrapper, 
+            num_workers=2, 
+            pin_memory=True, 
+            prefetch_factor=2
+        )
+        val_loader = DataLoader(
+            val_dataset, 
+            batch_size=Config.BATCH_SIZE, 
+            shuffle=False, 
+            collate_fn=collate_wrapper, 
+            num_workers=2, 
+            pin_memory=True
+        )
         
         model = DeepAudioFusionNetwork().to(Config.DEVICE)
+        
+        # --- KÍCH HOẠT T4x2 ---
+        if torch.cuda.device_count() > 1:
+            print(f"🚀 Kích hoạt DataParallel trên {torch.cuda.device_count()} GPUs!")
+            model = nn.DataParallel(model)
         
         # Chỉ train các Layer mới thêm vào (Attention Pooling, MLP Fusion)
         optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=Config.LR, weight_decay=Config.WEIGHT_DECAY)
@@ -325,7 +343,6 @@ def train_fusion_model(valid_df: pd.DataFrame):
         warmup_steps = int(0.1 * total_steps)
         scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
         
-        # Hàm loss BCE tính trên smoothed target
         criterion = nn.BCEWithLogitsLoss()
         
         best_val_f1 = 0.0
@@ -335,7 +352,7 @@ def train_fusion_model(valid_df: pd.DataFrame):
             model.train()
             train_loss = 0.0
             
-            for inputs, phys_feats, smoothed_targs, _ in tqdm(train_loader, desc=f"Epoch {epoch+1} Train"):
+            for inputs, phys_feats, smoothed_targs, _ in train_loader:
                 inputs, phys_feats, smoothed_targs = inputs.to(Config.DEVICE), phys_feats.to(Config.DEVICE), smoothed_targs.to(Config.DEVICE)
                 
                 optimizer.zero_grad()
@@ -350,7 +367,7 @@ def train_fusion_model(valid_df: pd.DataFrame):
                 
             train_loss /= len(train_loader)
             
-            # Validation (Đánh giá trên Original Target, KHÔNG dùng Smoothed Target)
+            # Validation
             model.eval()
             val_probs = []
             val_targets = []
@@ -370,12 +387,15 @@ def train_fusion_model(valid_df: pd.DataFrame):
             val_preds = (val_probs >= 0.5).astype(int)
             val_f1 = f1_score(val_targets, val_preds, average='macro')
             
-            print(f"Epoch {epoch+1}/{Config.EPOCHS} | Train Loss: {train_loss:.4f} | Val Macro F1 (Thresh=0.5): {val_f1:.4f}")
+            print(f"Epoch {epoch+1:02d}/{Config.EPOCHS} | Train Loss: {train_loss:.4f} | Val F1 (0.5): {val_f1:.4f}", end="")
             
             if val_f1 > best_val_f1:
                 best_val_f1 = val_f1
-                torch.save(model.state_dict(), best_model_path)
-                print(f"🌟 Saved New Best Model (F1: {val_f1:.4f})")
+                model_to_save = model.module if hasattr(model, 'module') else model
+                torch.save(model_to_save.state_dict(), best_model_path)
+                print(f" 🌟 (Saved Best)")
+            else:
+                print()
                 
         # Load best model for OOF
         print(f"[*] Đánh giá OOF cho Fold {fold+1}...")
@@ -397,10 +417,9 @@ def train_fusion_model(valid_df: pd.DataFrame):
         oof_probs[val_idx] = fold_probs
         oof_targets[val_idx] = y_val
         
-        # Lưu Scaler của fold (nếu cần inference sau này)
         joblib.dump(train_dataset.scaler, os.path.join(Config.MODELS_DIR, f"scaler_fold_{fold+1}.pkl"))
         
-        print("\n[!] Dừng sau Fold 1 để tiết kiệm thời gian (Phục vụ Test Pipeline). Bỏ lệnh break trong code để chạy full.")
+        print("\n[!] Dừng sau Fold 1 để tiết kiệm thời gian. Bỏ break để chạy full.")
         break
 
     # --- TỐI ƯU HÓA NGƯỠNG OOF ---

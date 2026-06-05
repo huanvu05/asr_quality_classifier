@@ -419,9 +419,8 @@ def train_fusion_model(valid_df: pd.DataFrame):
         
         joblib.dump(train_dataset.scaler, os.path.join(Config.MODELS_DIR, f"scaler_fold_{fold+1}.pkl"))
         
-        print("\n[!] Dừng sau Fold 1 để tiết kiệm thời gian. Bỏ break để chạy full.")
-        break
-
+        # Đã gỡ bỏ break để chạy full 5 folds
+        
     # --- TỐI ƯU HÓA NGƯỠNG OOF ---
     valid_mask = oof_probs > 0 
     final_y_true = oof_targets[valid_mask]

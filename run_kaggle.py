@@ -145,6 +145,13 @@ class WhisperTranscriber:
         self.model     = WhisperForConditionalGeneration.from_pretrained(
             model_name, torch_dtype=torch.float32
         ).to(device)
+        
+        # --- KÍCH HOẠT T4x2 CHO WHISPER ---
+        if torch.cuda.device_count() > 1 and "cuda" in str(device):
+            print(f"🚀 Parallelizing Whisper on {torch.cuda.device_count()} GPUs!")
+            self.model = torch.nn.DataParallel(self.model)
+        # ----------------------------------
+        
         self.model.eval()
         # Forced Vietnamese
         self.forced_ids = self.processor.get_decoder_prompt_ids(
@@ -624,7 +631,7 @@ def main():
             model_name="openai/whisper-small",
             device=DEVICE
         )
-        BATCH = 16 if DEVICE == "cuda" else 2  # T4 xu ly 16 audio/batch
+        BATCH = 32 if DEVICE == "cuda" else 2  # T4x2 xu ly 32 audio/batch (16/GPU)
         feat_df = extract_all_features(df, AUDIO_DIR, whisper, batch_size=BATCH)
 
         del whisper; gc.collect()

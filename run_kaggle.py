@@ -109,27 +109,53 @@ def load_csv(csv_path: Path) -> pd.DataFrame:
     return df
 
 
-def find_audio_path(row: pd.Series, audio_dir: Path) -> str | None:
-    """Tìm file audio theo nhiều pattern khác nhau."""
-    candidates = []
-    basename = row.get('file_basename', '')
-    folder   = row.get('file_folder', '')
-    file_name_raw = str(row.get('file_name', ''))
-
-    # Pattern 1: data2/folder/file.wav
-    candidates.append(audio_dir / file_name_raw)
-    # Pattern 2: audio_dir/folder/file.wav
-    if folder and folder != '.':
-        candidates.append(audio_dir / folder / basename)
-    # Pattern 3: audio_dir/file.wav (flat)
-    candidates.append(audio_dir / basename)
-    # Pattern 4: data2/file.wav
-    candidates.append(audio_dir.parent / 'data2' / basename)
-
-    for p in candidates:
-        if p.exists():
-            return str(p)
-    return None
+def build_audio_lookup(audio_dir: Path) -> dict:
+    """
+    Scan TOÀN BỘ audio_dir recursive một lần duy nhất.
+    Trả về dict: {basename.lower() → full_path_str}
+    
+    Lý do cần: Audio trên Kaggle nằm trong subfolder UUID dài:
+      data2/{50009120251110113027_004_uuid}/clone2.wav
+    Không thể đoán được folder name → phải scan.
+    """
+    lookup = {}
+    search_roots = [audio_dir]
+    
+    # Mở rộng: thử thêm các vị trí khác có thể có audio
+    extra_roots = [
+        audio_dir.parent,                    # data/audio/
+        audio_dir.parent.parent,             # data/
+        audio_dir.parent.parent / 'audio',   # data/audio/ (alternative)
+    ]
+    for root in extra_roots:
+        if root.exists() and root not in search_roots:
+            search_roots.append(root)
+    
+    total_found = 0
+    for root in search_roots:
+        if not root.exists():
+            continue
+        for ext in ['*.wav', '*.mp3', '*.flac', '*.ogg']:
+            for p in root.rglob(ext):
+                key = p.name.lower()
+                if key not in lookup:  # ưu tiên path đầu tiên tìm thấy
+                    lookup[key] = str(p)
+                    total_found += 1
+    
+    print(f"[+] Audio lookup: tìm thấy {total_found} files trong {[str(r) for r in search_roots if r.exists()]}")
+    if total_found > 0:
+        # In vài mẫu để debug
+        sample_keys = list(lookup.keys())[:3]
+        for k in sample_keys:
+            print(f"    Sample: {k} → {lookup[k]}")
+    else:
+        print("[!] KHÔNG TÌM THẤY FILE AUDIO NÀO!")
+        print("    Kiểm tra lại cấu trúc thư mục:")
+        for root in search_roots:
+            if root.exists():
+                children = list(root.iterdir())[:5]
+                print(f"    {root}/ → {[c.name for c in children]}")
+    return lookup
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -264,15 +290,46 @@ def extract_all_features(df: pd.DataFrame, audio_dir: Path,
     """
     records = []
 
-    # Chuẩn bị danh sách valid files
+    # ── Bước 1: Build lookup table (scan recursive 1 lần) ──
+    print("[*] Scanning audio directory recursively...")
+    audio_lookup = build_audio_lookup(audio_dir)
+    
+    if len(audio_lookup) == 0:
+        print("[ERROR] Không tìm thấy audio files!")
+        print(f"  AUDIO_DIR = {audio_dir}")
+        print(f"  Exists    = {audio_dir.exists()}")
+        # In cây thư mục để debug
+        base = audio_dir.parent.parent  # data/
+        if base.exists():
+            print(f"  Cây thư mục {base}:")
+            for item in sorted(base.rglob('*'))[:20]:
+                print(f"    {item}")
+        return pd.DataFrame()
+
+    # ── Bước 2: Match CSV rows với audio paths ──
     valid_rows = []
-    print("[*] Scan audio files...")
+    missing    = []
     for _, row in df.iterrows():
-        audio_path = find_audio_path(row, audio_dir)
-        if audio_path:
-            valid_rows.append((row, audio_path))
+        basename = str(row.get('file_basename', '')).lower()
+        if basename in audio_lookup:
+            valid_rows.append((row, audio_lookup[basename]))
+        else:
+            missing.append(basename)
 
     print(f"[+] Tìm thấy {len(valid_rows)}/{len(df)} audio files")
+    if missing:
+        print(f"    Không tìm thấy {len(missing)} files, ví dụ: {missing[:3]}")
+        # Thử tìm gần đúng (partial match) nếu match tuyệt đối thất bại
+        if len(valid_rows) == 0 and len(audio_lookup) > 0:
+            print("[*] Thử match theo partial name...")
+            lookup_list = list(audio_lookup.keys())
+            for _, row in df.iterrows():
+                basename = str(row.get('file_basename', '')).lower()
+                # Tìm key chứa basename
+                matches = [k for k in lookup_list if basename in k or k in basename]
+                if matches:
+                    valid_rows.append((row, audio_lookup[matches[0]]))
+            print(f"    Partial match: tìm thấy {len(valid_rows)} files")
 
     # Batch processing
     for batch_start in tqdm(range(0, len(valid_rows), batch_size),

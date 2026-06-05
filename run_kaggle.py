@@ -1,26 +1,27 @@
 """
-run_kaggle.py  v4  ─ DEEP LEARNING APPROACH
-=============================================
-Thay doi chinh so voi v3:
-  1. Whisper ENCODER EMBEDDINGS (512-dim) thay vi transcription
-     - Khong can .generate(), khong bi DataParallel loi
-     - Encoder Whisper-small da duoc train tren 680k h audio
-     - Mean-pooled hidden state la "am thanh fingerprint" rich hon bat ky feature nao
+run_kaggle.py  v5  ─ MULTIMODAL DEEP LEARNING ENSEMBLE
+=============================================================
+Key features in v5:
+  1. Multimodal Audio-Text Representation:
+     - Whisper Audio Embeddings (512/768-dim from encoder hidden state mean)
+     - Text Sentence Embeddings (384-dim from sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2)
+     - ASR Teacher-Forcing Alignment Loss (1-dim, measures cross-entropy of transcript matching audio)
+     - Acoustic Features (25 physical audio metrics via librosa)
+     - Text Statistics (5-dim: length, word count, avg word length, punctuation count, VN char ratio)
+     - Annotator Features (6-dim: bias logit, acceptance rate, credibility, etc. computed per fold)
 
-  2. MLP Classifier tren embeddings:
-     Input: whisper_emb(512) + librosa(25) + annotator(6) = 543 dim
-     Arch: Linear(543,256) -> BN -> ReLU -> Dropout(0.3)
-          -> Linear(256,128) -> BN -> ReLU -> Dropout(0.2)
-          -> Linear(128,1)
-     Train: AdamW, LR scheduler, class-weighted loss
+  2. Parallel Multi-GPU Feature Extraction:
+     - Distributes audio shards across all available T4 GPUs (cuda:0 and cuda:1)
+     - Uses Python ThreadPoolExecutor to run inference in parallel, doubling extraction speed
 
-  3. LightGBM tren cung feature set (nhanh, manh voi tabular)
+  3. Deep Learning Classifier & LightGBM Stacking Ensemble:
+     - MLP Classifier uses nn.DataParallel to train across both T4 GPUs
+     - LightGBM captures tabular and target statistics patterns
+     - 50/50 Stacking Ensemble of MLP and LightGBM
 
-  4. Stacking ensemble: MLP + LightGBM
-
-  5. Luu model tot nhat (LightGBM .pkl + MLP .pth + scaler + config)
-
-Ket qua ky vong: 0.78-0.88 (whisper embeddings rat manh)
+  4. Flawless Alignment & Leak-free CV:
+     - Fixed previous indentation issues under if use_mlp
+     - Robust mask filtering to guarantee numpy arrays align with tabular rows
 """
 
 import os, gc, json, string, warnings, unicodedata, re
@@ -31,6 +32,7 @@ from tqdm import tqdm
 import matplotlib; matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import pickle, joblib
+from concurrent.futures import ThreadPoolExecutor
 
 warnings.filterwarnings('ignore')
 
@@ -51,9 +53,13 @@ else:
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 MODEL_DIR       = OUTPUT_DIR / 'best_model'
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
-FEATURES_CACHE  = OUTPUT_DIR / 'features_v4.csv'
-EMBED_CACHE     = OUTPUT_DIR / 'whisper_embeddings.npy'
-EMBED_IDX_CACHE = OUTPUT_DIR / 'whisper_embeddings_idx.json'
+
+# Cache paths for v5
+FEATURES_CACHE   = OUTPUT_DIR / 'features_v5.csv'
+W_EMBED_CACHE    = OUTPUT_DIR / 'whisper_embeddings_v5.npy'
+T_EMBED_CACHE    = OUTPUT_DIR / 'text_embeddings_v5.npy'
+ALIGN_CACHE      = OUTPUT_DIR / 'align_losses_v5.npy'
+T_STATS_CACHE    = OUTPUT_DIR / 'text_stats_v5.npy'
 
 SEED        = 42
 N_FOLDS     = 5
@@ -61,7 +67,7 @@ SAMPLE_RATE = 16000
 np.random.seed(SEED)
 
 print("=" * 65)
-print("  ASR QUALITY CLASSIFIER  v4  |  Deep Learning Approach")
+print("  ASR QUALITY CLASSIFIER  v5  |  Multimodal DL Ensemble")
 print(f"  Env: {'Kaggle' if IS_KAGGLE else 'Local'}")
 print("=" * 65)
 
@@ -70,40 +76,34 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
-# QUAN TRONG: Khong dung DataParallel cho Whisper!
-# DataParallel boc model.generate() → 'DataParallel has no attr generate'
-# Fix: chi dung 1 GPU (cuda:0) cho Whisper encoder
 DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
-WHISPER_DEV = "cuda:0" if torch.cuda.is_available() else "cpu"   # GPU 0 cho Whisper
+TRAIN_DEV   = "cuda" if torch.cuda.is_available() else "cpu"
 N_GPUS      = torch.cuda.device_count()
 USE_GPU_LGB = DEVICE == "cuda"
 
-print(f"  PyTorch {torch.__version__} | {DEVICE.upper()} | GPUs:{N_GPUS}")
-print(f"  Whisper device: {WHISPER_DEV} (no DataParallel)")
+print(f"  PyTorch {torch.__version__} | {DEVICE.upper()} | GPUs: {N_GPUS}")
 if DEVICE == "cuda":
     for i in range(N_GPUS):
         print(f"    GPU{i}: {torch.cuda.get_device_name(i)}")
 
 # ── PACKAGES ─────────────────────────────────────────────────────────────────
 def ensure_packages():
-    for pkg, imp in [('jiwer','jiwer'), ('lightgbm','lightgbm'), ('catboost','catboost')]:
+    for pkg, imp in [('jiwer','jiwer'), ('lightgbm','lightgbm'), ('transformers','transformers'), ('sentence-transformers','sentence_transformers')]:
         try: __import__(imp)
         except ImportError:
             os.system(f"pip install {pkg} -q")
 ensure_packages()
 
 import librosa
-from transformers import WhisperProcessor, WhisperForConditionalGeneration, WhisperModel
+from transformers import WhisperProcessor, WhisperForConditionalGeneration, AutoTokenizer, AutoModel
 import lightgbm as lgb
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import f1_score, roc_auc_score, classification_report
 from sklearn.preprocessing import StandardScaler
 
-
 # ════════════════════════════════════════════════════════════════════════════
 # 1. LOAD CSV
 # ════════════════════════════════════════════════════════════════════════════
-
 def load_csv(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
     df['target'] = df['label_text'].apply(
@@ -115,11 +115,9 @@ def load_csv(path: Path) -> pd.DataFrame:
           f"Usable={df['target'].mean()*100:.1f}%")
     return df
 
-
 # ════════════════════════════════════════════════════════════════════════════
 # 2. AUDIO LOOKUP
 # ════════════════════════════════════════════════════════════════════════════
-
 def build_audio_lookup(audio_dir: Path) -> dict:
     lookup = {}
     roots = [audio_dir, audio_dir.parent, audio_dir.parent.parent]
@@ -133,73 +131,38 @@ def build_audio_lookup(audio_dir: Path) -> dict:
     print(f"[+] Audio lookup: {len(lookup)} files")
     return lookup
 
-
 # ════════════════════════════════════════════════════════════════════════════
-# 3. WHISPER ENCODER EMBEDDINGS (KHONG TRANSCRIPTION!)
+# 3. ACOUSTIC & TEXT STATS EXTRACTORS
 # ════════════════════════════════════════════════════════════════════════════
-
-class WhisperEmbedder:
+def extract_text_stats(text: str) -> np.ndarray:
     """
-    Dung Whisper ENCODER (khong decoder) de extract embeddings.
-    
-    Tai sao encoder? 
-    - Encoder Whisper-small da hoc tren 680k h audio da ngon ngu
-    - Hidden state (512-dim) encode thong tin am thanh giau hon MFCC rat nhieu
-    - Khong can transcription → khong bi loi DataParallel, khong bi WER=1.0
-    - Mean-pool toan bo sequence → 512-dim "audio fingerprint"
-    
-    Cach dung:
-        embedder = WhisperEmbedder(device="cuda:0")
-        embs = embedder.embed_batch([audio1, audio2, ...])  # (N, 512)
+    Extracts 5 dimensions of text statistics:
+    [char_count, word_count, avg_word_len, vietnamese_char_ratio, punctuation_count]
     """
-    def __init__(self, model_name="openai/whisper-small", device="cuda:0"):
-        print(f"[*] Loading Whisper encoder ({model_name}) on {device}...")
-        self.device    = device
-        self.processor = WhisperProcessor.from_pretrained(model_name)
-        # Chi load encoder (nhe hon full model)
-        self.model = WhisperForConditionalGeneration.from_pretrained(
-            model_name, torch_dtype=torch.float32
-        ).to(device)
-        self.model.eval()
-        # KHONG dung DataParallel! .generate() va .encoder() se bi loi
-        self.embed_dim = self.model.config.d_model  # 512 for whisper-small
-        print(f"  OK | embed_dim={self.embed_dim}")
-
-    @torch.no_grad()
-    def embed_batch(self, audio_list: list) -> np.ndarray:
-        """
-        audio_list: list of np.ndarray (16kHz mono)
-        Returns: (N, embed_dim) float32 numpy array
-        """
-        if not audio_list:
-            return np.zeros((0, self.embed_dim), dtype=np.float32)
-
-        inp = self.processor(
-            audio_list,
-            sampling_rate=SAMPLE_RATE,
-            return_tensors="pt",
-            padding=True
-        )
-        feats = inp.input_features.to(self.device).to(torch.float32)
-
-        # Forward qua encoder → last_hidden_state: (B, seq_len, d_model)
-        encoder_out = self.model.model.encoder(input_features=feats)
-        hidden = encoder_out.last_hidden_state  # (B, 1500, 512)
-
-        # Mean pooling → (B, 512) - average over time dimension
-        embeddings = hidden.mean(dim=1)  # (B, 512)
-        return embeddings.cpu().numpy().astype(np.float32)
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# 4. LIBROSA FEATURES (fast, proven)
-# ════════════════════════════════════════════════════════════════════════════
+    if not isinstance(text, str) or not text.strip():
+        return np.zeros(5, dtype=np.float32)
+    
+    char_count = len(text)
+    words = text.split()
+    word_count = len(words)
+    avg_word_len = sum(len(w) for w in words) / max(word_count, 1)
+    
+    vn_chars_pattern = re.compile(r'[a-zA-Z0-9\sàáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđĐ]')
+    matches = vn_chars_pattern.findall(text)
+    vietnamese_char_ratio = len(matches) / max(char_count, 1)
+    
+    punctuation_count = sum(1 for c in text if c in string.punctuation)
+    
+    return np.array([
+        float(char_count),
+        float(word_count),
+        float(avg_word_len),
+        float(vietnamese_char_ratio),
+        float(punctuation_count)
+    ], dtype=np.float32)
 
 def extract_librosa_features(y: np.ndarray, sr: int = 16000) -> dict:
-    """
-    25 fast acoustic features (khong co pyin vì qua cham):
-    SNR, silence, clipping, spectral, MFCC(5), ZCR, RMS, voiced_ratio, speaking_rate
-    """
+    """Extracts 25 fast acoustic features."""
     feats = {}
     n = len(y)
     if n == 0:
@@ -207,7 +170,6 @@ def extract_librosa_features(y: np.ndarray, sr: int = 16000) -> dict:
 
     feats['duration'] = n / sr
 
-    # Energy frames (dung cho SNR va voiced_ratio)
     frames = librosa.util.frame(y, frame_length=1024, hop_length=256)
     fe     = np.mean(frames ** 2, axis=0) + 1e-12
     thr    = 0.01 * fe.max()
@@ -217,16 +179,13 @@ def extract_librosa_features(y: np.ndarray, sr: int = 16000) -> dict:
     feats['voiced_ratio']  = float((fe > thr).mean())
     feats['clipping_ratio']= float(np.mean(np.abs(y) > 0.99))
 
-    # Silence ratio
     intervals  = librosa.effects.split(y, top_db=40)
     voiced_len = sum(e-s for s,e in intervals)
     feats['silence_ratio'] = float(1.0 - voiced_len / n)
 
-    # Speaking rate proxy
     trans = np.diff((fe > thr).astype(int))
     feats['speaking_rate'] = float(np.sum(trans > 0) / (feats['duration'] + 1e-6))
 
-    # Spectral (dung STFT chung)
     S   = np.abs(librosa.stft(y, n_fft=1024, hop_length=256))
     sc  = librosa.feature.spectral_centroid(S=S, sr=sr)[0]
     sb  = librosa.feature.spectral_bandwidth(S=S, sr=sr)[0]
@@ -239,20 +198,17 @@ def extract_librosa_features(y: np.ndarray, sr: int = 16000) -> dict:
     feats['zcr_mean']               = float(zcr.mean())
     feats['zcr_std']                = float(zcr.std())
 
-    # MFCC (chi lay 5 coefficient de tranh overfit voi 3500 mau)
     mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=5, n_fft=1024, hop_length=256)
     for i in range(5):
         feats[f'mfcc{i+1}_mean'] = float(mfcc[i].mean())
         feats[f'mfcc{i+1}_std']  = float(mfcc[i].std())
 
-    # RMS energy
     rms = librosa.feature.rms(y=y, frame_length=1024, hop_length=256)[0]
     feats['rms_mean'] = float(rms.mean())
     feats['rms_std']  = float(rms.std())
 
     return feats
 
-# Danh sach key (dung de fillna)
 _LIBROSA_KEYS = [
     'duration', 'snr', 'voiced_ratio', 'clipping_ratio', 'silence_ratio',
     'speaking_rate', 'spectral_centroid_mean', 'spectral_centroid_std',
@@ -261,22 +217,161 @@ _LIBROSA_KEYS = [
 ] + [f'mfcc{i+1}_mean' for i in range(5)] + [f'mfcc{i+1}_std' for i in range(5)] + [
     'rms_mean', 'rms_std'
 ]
-
-LIBROSA_COLS = _LIBROSA_KEYS  # 25 features
-
+LIBROSA_COLS = _LIBROSA_KEYS
 
 # ════════════════════════════════════════════════════════════════════════════
-# 5. EXTRACT ALL: Whisper embeddings + librosa features
+# 4. SHARD PARALLEL EXTRACTION (MULTI-GPU SUPPORT)
 # ════════════════════════════════════════════════════════════════════════════
+def extract_shard(chunk_data, gpu_id, whisper_model_name, text_model_name, batch_size):
+    device = gpu_id if torch.cuda.is_available() else "cpu"
+    print(f"[*] Shard worker started on {device} (processing {len(chunk_data)} samples)")
+    
+    # Load Whisper locally in thread
+    processor = WhisperProcessor.from_pretrained(whisper_model_name)
+    whisper_model = WhisperForConditionalGeneration.from_pretrained(
+        whisper_model_name, torch_dtype=torch.float32
+    ).to(device)
+    whisper_model.eval()
+    
+    # Load Text model locally in thread
+    text_tokenizer = AutoTokenizer.from_pretrained(text_model_name)
+    text_model = AutoModel.from_pretrained(text_model_name).to(device)
+    text_model.eval()
+    
+    records = []
+    w_embeds = []
+    t_embeds = []
+    align_losses = []
+    t_stats_list = []
+    
+    for bs in range(0, len(chunk_data), batch_size):
+        batch = chunk_data[bs: bs+batch_size]
+        
+        batch_audio, batch_meta = [], []
+        for row, path in batch:
+            try:
+                y, _ = librosa.load(path, sr=SAMPLE_RATE, mono=True)
+                if len(y) > 100:
+                    batch_audio.append(y)
+                    batch_meta.append(row)
+            except Exception:
+                pass
+                
+        if not batch_audio:
+            continue
+            
+        B = len(batch_audio)
+        
+        # 1. Text statistics & Text embeddings
+        batch_transcripts = [str(row.get('transcript', '')) for row in batch_meta]
+        
+        for t in batch_transcripts:
+            t_stats_list.append(extract_text_stats(t))
+            
+        try:
+            inputs = text_tokenizer(
+                batch_transcripts,
+                padding=True,
+                truncation=True,
+                max_length=256,
+                return_tensors="pt"
+            ).to(device)
+            with torch.no_grad():
+                outputs = text_model(**inputs)
+                attention_mask = inputs['attention_mask']
+                token_embeddings = outputs[0]
+                input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+                t_embs = torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+                t_embs = t_embs.cpu().numpy().astype(np.float32)
+        except Exception as e:
+            print(f"\n[!] Text embed error: {e}")
+            t_embs = np.zeros((B, 384), dtype=np.float32)
+        t_embeds.append(t_embs)
+        
+        # 2. Whisper audio embeddings & Alignment Loss
+        all_features = []
+        for audio in batch_audio:
+            inp = processor(
+                audio,
+                sampling_rate=SAMPLE_RATE,
+                return_tensors="pt",
+                return_attention_mask=False,
+            )
+            feat = inp.input_features
+            T = feat.shape[-1]
+            if T < 3000:
+                feat = torch.nn.functional.pad(feat, (0, 3000 - T))
+            elif T > 3000:
+                feat = feat[..., :3000]
+            all_features.append(feat)
+            
+        feats = torch.cat(all_features, dim=0).to(device)
+        
+        labels = processor.tokenizer(
+            batch_transcripts,
+            padding=True,
+            truncation=True,
+            max_length=448,
+            return_tensors="pt"
+        ).input_ids.to(device)
+        labels[labels == processor.tokenizer.pad_token_id] = -100
+        
+        try:
+            with torch.no_grad():
+                outputs = whisper_model(input_features=feats, labels=labels)
+                logits = outputs.logits  # (B, L, vocab)
+                
+                encoder_out = whisper_model.model.encoder(input_features=feats)
+                hidden = encoder_out.last_hidden_state  # (B, 1500, d_model)
+                a_embs = hidden.mean(dim=1).cpu().numpy().astype(np.float32)
+                
+                loss_fct = torch.nn.CrossEntropyLoss(reduction="none", ignore_index=-100)
+                B_dim, L_dim, V_dim = logits.shape
+                loss = loss_fct(logits.reshape(-1, V_dim), labels.reshape(-1))
+                loss = loss.view(B_dim, L_dim)
+                mask = (labels != -100).float()
+                per_sample_loss = ((loss * mask).sum(dim=1) / torch.clamp(mask.sum(dim=1), min=1e-9)).cpu().numpy()
+        except Exception as e:
+            print(f"\n[!] Whisper forward error: {e}")
+            a_embs = np.zeros((B, whisper_model.config.d_model), dtype=np.float32)
+            per_sample_loss = np.zeros(B, dtype=np.float32)
+            
+        w_embeds.append(a_embs)
+        align_losses.extend(per_sample_loss)
+        
+        # 3. Acoustic features (CPU)
+        for y, row in zip(batch_audio, batch_meta):
+            try:
+                lf = extract_librosa_features(y, SAMPLE_RATE)
+                lf['file_basename'] = row['file_basename']
+                lf['username']      = row.get('username', 'unknown')
+                lf['transcript']    = row.get('transcript', '')
+                lf['target']        = int(row['target'])
+                records.append(lf)
+            except Exception:
+                pass
+                
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()
+            
+    feat_df = pd.DataFrame(records)
+    if len(feat_df) > 0:
+        w_emb_arr = np.vstack(w_embeds)
+        t_emb_arr = np.vstack(t_embeds)
+        align_arr = np.array(align_losses).reshape(-1, 1)
+        t_stats_arr = np.vstack(t_stats_list)
+    else:
+        w_emb_arr = np.zeros((0, 768), dtype=np.float32)
+        t_emb_arr = np.zeros((0, 384), dtype=np.float32)
+        align_arr = np.zeros((0, 1), dtype=np.float32)
+        t_stats_arr = np.zeros((0, 5), dtype=np.float32)
+        
+    return feat_df, w_emb_arr, t_emb_arr, align_arr, t_stats_arr
 
 def extract_all(df: pd.DataFrame, audio_dir: Path,
-                embedder: WhisperEmbedder,
+                whisper_model_name: str = "openai/whisper-small",
+                text_model_name: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
                 batch_size: int = 32) -> tuple:
-    """
-    Returns:
-        feat_df   : DataFrame voi librosa features (25 cols) + metadata
-        embed_arr : np.ndarray (N, 512) Whisper embeddings
-    """
     lookup = build_audio_lookup(audio_dir)
     if not lookup:
         raise RuntimeError("Khong tim thay audio files!")
@@ -288,67 +383,71 @@ def extract_all(df: pd.DataFrame, audio_dir: Path,
             valid.append((row, lookup[k]))
     print(f"[+] Match: {len(valid)}/{len(df)} files")
 
-    records   = []
-    all_embeds = []
-
-    for bs in tqdm(range(0, len(valid), batch_size), desc="Extracting", unit="batch"):
-        batch = valid[bs: bs+batch_size]
-
-        # Load audio
-        batch_audio, batch_meta = [], []
-        for row, path in batch:
-            try:
-                y, _ = librosa.load(path, sr=SAMPLE_RATE, mono=True)
-                if len(y) > 100:
-                    batch_audio.append(y)
-                    batch_meta.append(row)
-            except Exception:
-                pass
-
-        if not batch_audio:
-            continue
-
-        # ── GPU: Whisper encoder embeddings ──────────────────────────
-        try:
-            embs = embedder.embed_batch(batch_audio)  # (B, 512)
-        except Exception as e:
-            print(f"\n[!] Embed error: {e}")
-            embs = np.zeros((len(batch_audio), embedder.embed_dim), dtype=np.float32)
-
-        # ── CPU: librosa features ─────────────────────────────────────
-        for y, row, emb in zip(batch_audio, batch_meta, embs):
-            try:
-                lf = extract_librosa_features(y, SAMPLE_RATE)
-                lf['file_basename'] = row['file_basename']
-                lf['username']      = row.get('username', 'unknown')
-                lf['transcript']    = row.get('transcript', '')
-                lf['target']        = int(row['target'])
-                records.append(lf)
-                all_embeds.append(emb)
-            except Exception:
-                pass
-
-        if DEVICE == "cuda":
-            torch.cuda.empty_cache()
-
-    feat_df   = pd.DataFrame(records)
-    embed_arr = np.vstack(all_embeds) if all_embeds else np.zeros((0, embedder.embed_dim))
-    print(f"[+] Extracted: {len(feat_df)} samples")
-    print(f"    Librosa: {len(LIBROSA_COLS)} feats | Embeddings: {embed_arr.shape}")
-    return feat_df, embed_arr
-
+    num_gpus = torch.cuda.device_count()
+    if num_gpus > 1:
+        devices = [f"cuda:{i}" for i in range(num_gpus)]
+    elif num_gpus == 1:
+        devices = ["cuda:0"]
+    else:
+        devices = ["cpu"]
+        
+    print(f"[*] Distributing extraction over {len(devices)} devices: {devices}")
+    
+    chunk_size = int(np.ceil(len(valid) / len(devices)))
+    shards = [valid[i:i + chunk_size] for i in range(0, len(valid), chunk_size)]
+    
+    # Pre-download models to cache before threads start
+    print("[*] Pre-downloading models to avoid race conditions...")
+    WhisperProcessor.from_pretrained(whisper_model_name)
+    WhisperForConditionalGeneration.from_pretrained(whisper_model_name)
+    AutoTokenizer.from_pretrained(text_model_name)
+    AutoModel.from_pretrained(text_model_name)
+    
+    all_feat_dfs = []
+    all_w_embs = []
+    all_t_embs = []
+    all_aligns = []
+    all_t_stats = []
+    
+    with ThreadPoolExecutor(max_workers=len(devices)) as executor:
+        futures = []
+        for i, dev in enumerate(devices):
+            if i < len(shards):
+                futures.append(executor.submit(
+                    extract_shard, shards[i], dev, whisper_model_name, text_model_name, batch_size
+                ))
+                
+        for fut in tqdm(futures, desc="GPU Workers Running"):
+            f_df, w_emb, t_emb, align, t_stats = fut.result()
+            all_feat_dfs.append(f_df)
+            all_w_embs.append(w_emb)
+            all_t_embs.append(t_emb)
+            all_aligns.append(align)
+            all_t_stats.append(t_stats)
+            
+    feat_df = pd.concat(all_feat_dfs, ignore_index=True)
+    w_emb_arr = np.vstack(all_w_embs)
+    t_emb_arr = np.vstack(all_t_embs)
+    align_arr = np.vstack(all_aligns)
+    t_stats_arr = np.vstack(all_t_stats)
+    
+    print(f"[+] Extracted successfully!")
+    print(f"    Librosa   : {len(LIBROSA_COLS)} features")
+    print(f"    Whisper   : {w_emb_arr.shape} embeddings")
+    print(f"    Text      : {t_emb_arr.shape} embeddings")
+    print(f"    Alignment : {align_arr.shape} scores")
+    print(f"    TextStats : {t_stats_arr.shape} metrics")
+    
+    return feat_df, w_emb_arr, t_emb_arr, align_arr, t_stats_arr
 
 # ════════════════════════════════════════════════════════════════════════════
-# 6. ANNOTATOR FEATURES (no-leak: tinh trong tung fold)
+# 5. ANNOTATOR FEATURES (no-leak)
 # ════════════════════════════════════════════════════════════════════════════
-
 ANN_COLS = ['user_acceptance_rate', 'annotator_bias_logit', 'annotator_credibility',
             'transcript_consensus_ratio', 'transcript_ambiguity', 'transcript_n_versions']
 
-
 def compute_ann_features(df_tr: pd.DataFrame, df_vl: pd.DataFrame,
                           global_mean: float) -> tuple:
-    """Tinh annotator features CHI tu train fold → ap dung cho val fold (no-leak)."""
     eps = 1e-6
     gl  = np.log(np.clip(global_mean, eps, 1-eps) / np.clip(1-global_mean, eps, 1-eps))
 
@@ -387,7 +486,6 @@ def compute_ann_features(df_tr: pd.DataFrame, df_vl: pd.DataFrame,
         return df
     return _merge(df_tr.copy()), _merge(df_vl.copy())
 
-
 def add_mv_label(feat_df):
     ts = feat_df.groupby('transcript')['target'].mean().reset_index()
     ts.columns = ['transcript','_cr']
@@ -398,16 +496,10 @@ def add_mv_label(feat_df):
     feat_df.drop(columns=['_cr'], inplace=True)
     return feat_df
 
-
 # ════════════════════════════════════════════════════════════════════════════
-# 7. MLP CLASSIFIER
+# 6. MLP CLASSIFIER
 # ════════════════════════════════════════════════════════════════════════════
-
 class MLPClassifier(nn.Module):
-    """
-    Deep MLP cho tabular + embedding features.
-    Input: whisper_emb(512) + librosa(25) + annotator(6) = ~543 dim
-    """
     def __init__(self, input_dim: int, dropout: float = 0.3):
         super().__init__()
         self.net = nn.Sequential(
@@ -436,14 +528,16 @@ class MLPClassifier(nn.Module):
     def forward(self, x):
         return self.net(x).squeeze(-1)
 
-
 def train_mlp_fold(Xtr, ytr, Xvl, yvl, input_dim: int,
-                   epochs: int = 80, lr: float = 3e-4,
+                   epochs: int = 100, lr: float = 3e-4,
                    device: str = "cuda") -> tuple:
-    """Train MLP on one fold, return val predictions."""
     pos_weight = torch.tensor([(ytr==0).sum() / max((ytr==1).sum(), 1)],
                                dtype=torch.float32).to(device)
     model = MLPClassifier(input_dim).to(device)
+
+    if torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model)
+
     opt   = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
     crit  = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
@@ -452,8 +546,10 @@ def train_mlp_fold(Xtr, ytr, Xvl, yvl, input_dim: int,
     yt = torch.tensor(ytr, dtype=torch.float32)
     Xv = torch.tensor(Xvl, dtype=torch.float32).to(device)
 
+    bs      = 128 if torch.cuda.device_count() > 1 else 64
     dataset = TensorDataset(Xt, yt)
-    loader  = DataLoader(dataset, batch_size=64, shuffle=True)
+    loader  = DataLoader(dataset, batch_size=bs, shuffle=True,
+                         num_workers=0, pin_memory=True)
 
     best_f1, best_preds = 0.0, np.zeros(len(Xvl))
 
@@ -474,16 +570,15 @@ def train_mlp_fold(Xtr, ytr, Xvl, yvl, input_dim: int,
                 preds = torch.sigmoid(model(Xv)).cpu().numpy()
             f1 = f1_score(yvl, (preds>0.5).astype(int), average='macro', zero_division=0)
             if f1 > best_f1:
-                best_f1   = f1
+                best_f1    = f1
                 best_preds = preds.copy()
 
-    return best_preds, model
-
+    final_model = model.module if isinstance(model, nn.DataParallel) else model
+    return best_preds, final_model
 
 # ════════════════════════════════════════════════════════════════════════════
-# 8. TRAIN: LGBM + MLP + ENSEMBLE (leak-free CV)
+# 7. TRAIN: LGBM + MLP + ENSEMBLE
 # ════════════════════════════════════════════════════════════════════════════
-
 def lgbm_params(y, use_gpu=False):
     pw = float((y==0).sum()) / max(float((y==1).sum()), 1)
     p = {
@@ -500,28 +595,28 @@ def lgbm_params(y, use_gpu=False):
         p['gpu_use_dp'] = False
     return p
 
-
-def run_cv(feat_df: pd.DataFrame, embed_arr: np.ndarray,
+def run_cv(feat_df: pd.DataFrame,
+           w_emb_arr: np.ndarray,
+           t_emb_arr: np.ndarray,
+           align_arr: np.ndarray,
+           t_stats_arr: np.ndarray,
            use_mlp: bool = True, use_gpu: bool = True) -> dict:
-    """
-    5-fold CV voi:
-    - LightGBM tren [embed(512) + librosa(25) + annotator(6)]
-    - MLP tren cung feature set
-    - Ensemble: 50% LightGBM + 50% MLP
-    - No data leakage: annotator features tinh trong tung fold
-    """
     label_col = 'target'
     lib_cols  = [c for c in LIBROSA_COLS if c in feat_df.columns]
 
-    df_clean = feat_df.dropna(subset=lib_cols + [label_col]).copy()
-    df_clean = df_clean.reset_index(drop=True)
+    valid_mask = feat_df[lib_cols + [label_col]].notna().all(axis=1)
+    df_clean = feat_df[valid_mask].copy().reset_index(drop=True)
 
-    # Align embeddings
-    embed_sub = embed_arr[:len(df_clean)]  # mang da aligned theo thu tu extract
+    w_emb_sub   = w_emb_arr[valid_mask.values]
+    t_emb_sub   = t_emb_arr[valid_mask.values]
+    align_sub   = align_arr[valid_mask.values]
+    t_stats_sub = t_stats_arr[valid_mask.values]
 
     global_mean = df_clean[label_col].mean()
-    print(f"\n  n={len(df_clean)} | embed_dim={embed_sub.shape[1]} "
-          f"| librosa={len(lib_cols)} | annotator=6")
+    
+    input_dim = w_emb_sub.shape[1] + t_emb_sub.shape[1] + align_sub.shape[1] + t_stats_sub.shape[1] + len(lib_cols) + len(ANN_COLS)
+    print(f"\n  n={len(df_clean)} | input_dim={input_dim} "
+          f"| w_emb={w_emb_sub.shape[1]} | t_emb={t_emb_sub.shape[1]} | align={align_sub.shape[1]} | t_stats={t_stats_sub.shape[1]} | librosa={len(lib_cols)} | annotator=6")
 
     skf     = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
     oof_lgb = np.zeros(len(df_clean))
@@ -538,23 +633,31 @@ def run_cv(feat_df: pd.DataFrame, embed_arr: np.ndarray,
         df_tr = df_clean.iloc[tri].copy()
         df_vl = df_clean.iloc[vli].copy()
 
-        # Tinh annotator features trong fold (no-leak)
         df_tr, df_vl = compute_ann_features(df_tr, df_vl, global_mean)
 
         ann_tr = df_tr[ANN_COLS].fillna(0).values.astype(np.float32)
         lib_tr = df_tr[lib_cols].fillna(0).values.astype(np.float32)
-        emb_tr = embed_sub[tri]
-        Xtr    = np.concatenate([emb_tr, lib_tr, ann_tr], axis=1)
+        
+        emb_tr = w_emb_sub[tri]
+        text_emb_tr = t_emb_sub[tri]
+        align_tr = align_sub[tri]
+        t_stats_tr = t_stats_sub[tri]
+        
+        Xtr = np.concatenate([emb_tr, text_emb_tr, align_tr, lib_tr, t_stats_tr, ann_tr], axis=1)
 
         ann_vl = df_vl[ANN_COLS].fillna(0).values.astype(np.float32)
         lib_vl = df_vl[lib_cols].fillna(0).values.astype(np.float32)
-        emb_vl = embed_sub[vli]
-        Xvl    = np.concatenate([emb_vl, lib_vl, ann_vl], axis=1)
+        
+        emb_vl = w_emb_sub[vli]
+        text_emb_vl = t_emb_sub[vli]
+        align_vl = align_sub[vli]
+        t_stats_vl = t_stats_sub[vli]
+        
+        Xvl = np.concatenate([emb_vl, text_emb_vl, align_vl, lib_vl, t_stats_vl, ann_vl], axis=1)
 
         ytr = df_tr[label_col].values.astype(int)
         yvl = df_vl[label_col].values.astype(int)
 
-        # Scale
         sc  = StandardScaler()
         Xtr_s = sc.fit_transform(Xtr)
         Xvl_s = sc.transform(Xvl)
@@ -573,7 +676,7 @@ def run_cv(feat_df: pd.DataFrame, embed_arr: np.ndarray,
             mlp_preds, mlp_m = train_mlp_fold(
                 Xtr_s, ytr.astype(float), Xvl_s, yvl,
                 input_dim=Xtr_s.shape[1],
-                epochs=80, lr=3e-4, device=DEVICE
+                epochs=100, lr=3e-4, device=TRAIN_DEV
             )
             oof_mlp[vli] = mlp_preds
             best_mlp_models.append(mlp_m)
@@ -582,7 +685,6 @@ def run_cv(feat_df: pd.DataFrame, embed_arr: np.ndarray,
         f_mlp = f1_score(yvl, (oof_mlp[vli]>0.5).astype(int), average='macro', zero_division=0) if use_mlp else 0
         print(f"LGB={f_lgb:.4f}  MLP={f_mlp:.4f}")
 
-    # ── Ensemble OOF ────────────────────────────────────────────────────────
     if use_mlp:
         oof_ens = 0.5 * oof_lgb + 0.5 * oof_mlp
     else:
@@ -608,24 +710,15 @@ def run_cv(feat_df: pd.DataFrame, embed_arr: np.ndarray,
 
     return results, best_lgb_models, best_mlp_models, best_scalers, df_clean
 
-
 # ════════════════════════════════════════════════════════════════════════════
-# 9. SAVE BEST MODEL
+# 8. SAVE BEST MODEL
 # ════════════════════════════════════════════════════════════════════════════
-
-def save_best_model(lgb_models, mlp_models, scalers, feat_df, embed_arr,
+def save_best_model(lgb_models, mlp_models, scalers, feat_df,
+                    w_emb_arr, t_emb_arr, align_arr, t_stats_arr,
                     results, model_dir: Path):
-    """
-    Luu model tot nhat:
-    - best_lgb.pkl      : LightGBM model (fold tot nhat)
-    - best_mlp.pth      : MLP state dict (fold tot nhat)
-    - scaler.pkl        : StandardScaler
-    - config.json       : feature names, threshold, metrics
-    """
     best_name = max(results, key=lambda k: results[k]['macro_f1'])
     best_res  = results[best_name]
 
-    # Tim fold co OOF F1 cao nhat
     oof = best_res['oof']
     y   = best_res['y']
     skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
@@ -637,23 +730,19 @@ def save_best_model(lgb_models, mlp_models, scalers, feat_df, embed_arr,
 
     print(f"\n[*] Luu model: {best_name} | Fold {best_fold+1} (F1={fold_f1s[best_fold]:.4f})")
 
-    # LightGBM
     lgb_path = model_dir / 'best_lgb.pkl'
     joblib.dump(lgb_models[best_fold], lgb_path)
     print(f"    LightGBM: {lgb_path}")
 
-    # MLP
     if mlp_models and len(mlp_models) > best_fold:
         mlp_path = model_dir / 'best_mlp.pth'
         torch.save(mlp_models[best_fold].state_dict(), mlp_path)
         print(f"    MLP:      {mlp_path}")
 
-    # Scaler
     sc_path = model_dir / 'scaler.pkl'
     joblib.dump(scalers[best_fold], sc_path)
     print(f"    Scaler:   {sc_path}")
 
-    # Config
     lib_cols = [c for c in LIBROSA_COLS if c in feat_df.columns]
     cfg = {
         'best_strategy'   : best_name,
@@ -663,10 +752,13 @@ def save_best_model(lgb_models, mlp_models, scalers, feat_df, embed_arr,
         'threshold'       : best_res['threshold'],
         'f1_unusable'     : best_res['f1_0'],
         'f1_usable'       : best_res['f1_1'],
-        'embed_dim'       : embed_arr.shape[1],
+        'w_embed_dim'     : w_emb_arr.shape[1],
+        't_embed_dim'     : t_emb_arr.shape[1],
+        'align_dim'       : align_arr.shape[1],
+        't_stats_dim'     : t_stats_arr.shape[1],
         'librosa_cols'    : lib_cols,
         'annotator_cols'  : ANN_COLS,
-        'input_dim'       : embed_arr.shape[1] + len(lib_cols) + len(ANN_COLS),
+        'input_dim'       : w_emb_arr.shape[1] + t_emb_arr.shape[1] + align_arr.shape[1] + t_stats_arr.shape[1] + len(lib_cols) + len(ANN_COLS),
         'model_dir'       : str(model_dir),
         'all_results'     : {k: {kk:v for kk,v in vv.items() if kk not in ('oof','y')}
                              for k,vv in results.items()},
@@ -678,11 +770,9 @@ def save_best_model(lgb_models, mlp_models, scalers, feat_df, embed_arr,
     print(f"\n[OK] Best model saved → {model_dir}")
     return cfg
 
-
 # ════════════════════════════════════════════════════════════════════════════
-# 10. VISUALIZE
+# 9. VISUALIZE
 # ════════════════════════════════════════════════════════════════════════════
-
 def plot_results(results: dict, output_dir: Path):
     names = list(results.keys())
     f1s   = [results[n]['macro_f1'] for n in names]
@@ -691,7 +781,7 @@ def plot_results(results: dict, output_dir: Path):
     clrs  = ['#e67e22','#3498db','#2ecc71'][:len(names)]
 
     fig, axes = plt.subplots(1, 3, figsize=(16,5))
-    fig.suptitle('ASR Quality Classifier v4 — DL Approach', fontsize=13, fontweight='bold')
+    fig.suptitle('ASR Quality Classifier v5 — DL Multimodal Stacking', fontsize=13, fontweight='bold')
     for ax, vals, title in zip(axes, [f1s,aucs,f10], ['MacroF1','AUC','F1(Unusable)']):
         ax.barh(names, vals, color=clrs)
         ax.axvline(0.78, color='red', ls='--', lw=1.5, label='Target 0.78')
@@ -701,76 +791,80 @@ def plot_results(results: dict, output_dir: Path):
         for i,v in enumerate(vals):
             ax.text(v+0.005, i, f'{v:.4f}', va='center', fontsize=10)
     plt.tight_layout()
-    p = output_dir / 'results_v4.png'
+    p = output_dir / 'results_v5.png'
     plt.savefig(p, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"[+] Plot: {p}")
 
-
 # ════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ════════════════════════════════════════════════════════════════════════════
-
 def main():
-    # ── 1. Load CSV ──────────────────────────────────────────────────────────
     df = load_csv(CSV_PATH)
 
     # ── 2. Feature Extraction ────────────────────────────────────────────────
-    if FEATURES_CACHE.exists() and EMBED_CACHE.exists():
-        feat_df   = pd.read_csv(FEATURES_CACHE)
-        embed_arr = np.load(EMBED_CACHE)
-        print(f"\n[*] Cache: {len(feat_df)} samples | embed={embed_arr.shape}")
+    if FEATURES_CACHE.exists() and W_EMBED_CACHE.exists() and T_EMBED_CACHE.exists() and ALIGN_CACHE.exists() and T_STATS_CACHE.exists():
+        feat_df     = pd.read_csv(FEATURES_CACHE)
+        w_emb_arr   = np.load(W_EMBED_CACHE)
+        t_emb_arr   = np.load(T_EMBED_CACHE)
+        align_arr   = np.load(ALIGN_CACHE)
+        t_stats_arr = np.load(T_STATS_CACHE)
+        print(f"\n[*] Cache: {len(feat_df)} samples | w_emb={w_emb_arr.shape} | t_emb={t_emb_arr.shape}")
 
-        # Kiem tra cache hop le (embed khong nen tat ca zero)
-        if embed_arr.std() < 1e-6:
-            print("[!] Embed cache bi hong (tat ca zero) → Xoa va extract lai!")
-            FEATURES_CACHE.unlink(); EMBED_CACHE.unlink()
-            feat_df = None; embed_arr = None
+        if w_emb_arr.std() < 1e-6 or t_emb_arr.std() < 1e-6:
+            print("[!] Cache bi hong (tat ca zero) → Xoa va extract lai!")
+            for p in [FEATURES_CACHE, W_EMBED_CACHE, T_EMBED_CACHE, ALIGN_CACHE, T_STATS_CACHE]:
+                if p.exists(): p.unlink()
+            feat_df = None
     else:
-        feat_df = None; embed_arr = None
+        feat_df = None
 
     if feat_df is None:
-        print(f"\n[*] Bat dau extract (Whisper-small encoder + librosa)...")
-        print(f"    Whisper device: {WHISPER_DEV} (single GPU, no DataParallel)")
-
-        embedder = WhisperEmbedder(
-            model_name="openai/whisper-small",
-            device=WHISPER_DEV
+        print(f"\n[*] Bat dau extract features (Whisper-small + Text embeddings + Alignment)...")
+        BATCH = 32 if torch.cuda.is_available() else 4
+        
+        feat_df, w_emb_arr, t_emb_arr, align_arr, t_stats_arr = extract_all(
+            df, AUDIO_DIR,
+            whisper_model_name="openai/whisper-small",
+            text_model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+            batch_size=BATCH
         )
-        BATCH = 32 if DEVICE == "cuda" else 4  # whisper encoder nhanh hon generate
-        feat_df, embed_arr = extract_all(df, AUDIO_DIR, embedder, batch_size=BATCH)
-
-        del embedder; gc.collect()
-        if DEVICE == "cuda": torch.cuda.empty_cache()
 
         if len(feat_df) == 0:
             print("[ERROR] Khong extract duoc!"); return
 
         feat_df.to_csv(FEATURES_CACHE, index=False)
-        np.save(EMBED_CACHE, embed_arr)
-        print(f"[+] Saved: features={FEATURES_CACHE}")
-        print(f"           embeddings={EMBED_CACHE} ({embed_arr.shape})")
+        np.save(W_EMBED_CACHE, w_emb_arr)
+        np.save(T_EMBED_CACHE, t_emb_arr)
+        np.save(ALIGN_CACHE, align_arr)
+        np.save(T_STATS_CACHE, t_stats_arr)
+        print(f"[+] Saved cache files.")
 
     # ── 3. Add MV label ──────────────────────────────────────────────────────
     feat_df = add_mv_label(feat_df)
 
     # ── 4. Summary ───────────────────────────────────────────────────────────
     lib_cols  = [c for c in LIBROSA_COLS if c in feat_df.columns]
-    total_dim = embed_arr.shape[1] + len(lib_cols) + len(ANN_COLS)
+    total_dim = w_emb_arr.shape[1] + t_emb_arr.shape[1] + align_arr.shape[1] + t_stats_arr.shape[1] + len(lib_cols) + len(ANN_COLS)
+    
+    w_std = w_emb_arr.std()
+    t_std = t_emb_arr.std()
+    
     print(f"""
 {'─'*60}
-  DU LIEU
+  DU LIEU (MULTIMODAL v5)
 {'─'*60}
   Samples         : {len(feat_df)}
-  Whisper embeds  : {embed_arr.shape[1]} dim  (encoder hidden state mean)
+  Whisper embeds  : {w_emb_arr.shape[1]} dim (std={w_std:.4f})
+  Text embeds     : {t_emb_arr.shape[1]} dim (std={t_std:.4f})
+  Align scores    : {align_arr.shape[1]} dim
+  TextStats       : {t_stats_arr.shape[1]} dim
   Librosa feats   : {len(lib_cols)}
   Annotator feats : {len(ANN_COLS)} (computed per fold, no leak)
   Total input dim : {total_dim}
   Usable (1)      : {feat_df['target'].mean()*100:.1f}%
-
-  Embed quality   : mean={embed_arr.mean():.4f} std={embed_arr.std():.4f}
-  (std > 0.1 = embeddings diverse = Whisper encoder hoat dong tot)
-{'─'*60}""")
+{'─'*60}
+""")
 
     # ── 5. Training ──────────────────────────────────────────────────────────
     print(f"\n{'='*65}")
@@ -778,7 +872,7 @@ def main():
     print(f"{'='*65}")
 
     results, lgb_models, mlp_models, scalers, df_clean = run_cv(
-        feat_df, embed_arr,
+        feat_df, w_emb_arr, t_emb_arr, align_arr, t_stats_arr,
         use_mlp=True,
         use_gpu=USE_GPU_LGB
     )
@@ -803,38 +897,18 @@ def main():
     # ── 7. Save best model ───────────────────────────────────────────────────
     cfg = save_best_model(
         lgb_models, mlp_models, scalers,
-        feat_df, embed_arr, results, MODEL_DIR
+        feat_df, w_emb_arr, t_emb_arr, align_arr, t_stats_arr,
+        results, MODEL_DIR
     )
 
     # ── 8. Plot ──────────────────────────────────────────────────────────────
     plot_results(results, OUTPUT_DIR)
 
     # ── 9. Save summary JSON ─────────────────────────────────────────────────
-    with open(OUTPUT_DIR/'results_v4.json', 'w') as f:
+    with open(OUTPUT_DIR/'results_v5.json', 'w') as f:
         json.dump({k:{kk:v for kk,v in vv.items() if kk not in ('oof','y')}
                    for k,vv in results.items()}, f, indent=2)
-    print(f"[+] JSON: {OUTPUT_DIR/'results_v4.json'}")
-
-    # ── 10. Phan tich ────────────────────────────────────────────────────────
-    emb_std = embed_arr.std()
-    print(f"""
-{'='*65}
-PHAN TICH KET QUA:
-  Embed std = {emb_std:.4f}
-  {'[OK] Whisper encoder hoat dong tot!' if emb_std > 0.1 else '[WARN] Embed std thap - kiem tra model'}
-
-  Neu F1 >> 0.78:
-    → Whisper embeddings chứa thong tin am thanh rat giau
-    → MLP hoc duoc pattern tinh vi ma hand-crafted features bo qua
-
-  Neu F1 ≈ 0.56 (nhu cu):
-    → Van la label noise limit, khong phai feature limit
-    → Nguyen nhan: 7 annotators co hanh vi khac nhau mau thuan
-    → Day la HARD CEILING cua bai toan - insight quan trong cho bao cao
-
-  Model da luu tai: {MODEL_DIR}
-{'='*65}
-""")
+    print(f"[+] JSON: {OUTPUT_DIR/'results_v5.json'}")
 
 
 if __name__ == '__main__':

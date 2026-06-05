@@ -572,19 +572,31 @@ def compute_annotator_features_on_train(df_train: pd.DataFrame, df_val: pd.DataF
     ) * 2
 
     # Merge vào train và val
+    # QUAN TRỌNG: Drop các cột annotator CŨ trước khi merge lại
+    # Vì feat_df đã có sẵn các cột này từ add_annotator_features() toàn dataset
+    # → Nếu không drop, pandas sẽ tạo ra _x/_y suffix → KeyError
+    COLS_TO_DROP = ['user_acceptance_rate', 'annotator_bias_logit', 'annotator_credibility',
+                    'transcript_n_versions', 'transcript_consensus_ratio', 'transcript_ambiguity']
+
     def _merge(df):
+        # Drop cột cũ (nếu có) để tránh _x/_y suffix conflict
+        drop_existing = [c for c in COLS_TO_DROP if c in df.columns]
+        if drop_existing:
+            df = df.drop(columns=drop_existing)
+
+        # Merge annotator-level features từ train fold
         df = df.merge(user_stats[['username', 'user_acceptance_rate',
                                    'annotator_bias_logit', 'annotator_credibility']],
                       on='username', how='left')
+        # Merge transcript-level features từ train fold
         df = df.merge(trans_stats[['transcript', 'transcript_n_versions',
                                     'transcript_consensus_ratio', 'transcript_ambiguity']],
                       on='transcript', how='left')
-        # Val có thể có transcript mới → fillna bằng global prior
-        df['transcript_consensus_ratio'] = df['transcript_consensus_ratio'].fillna(
-            global_target_mean
-        )
+
+        # Val có thể có transcript không có trong train → fillna bằng global prior
+        df['transcript_consensus_ratio'] = df['transcript_consensus_ratio'].fillna(global_target_mean)
         df['transcript_ambiguity']       = df['transcript_ambiguity'].fillna(0.5)
-        df['transcript_n_versions']      = df['transcript_n_versions'].fillna(1)
+        df['transcript_n_versions']      = df['transcript_n_versions'].fillna(1.0)
         df['user_acceptance_rate']       = df['user_acceptance_rate'].fillna(global_target_mean)
         df['annotator_bias_logit']       = df['annotator_bias_logit'].fillna(0.0)
         df['annotator_credibility']      = df['annotator_credibility'].fillna(0.5)

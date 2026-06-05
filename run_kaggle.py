@@ -166,36 +166,32 @@ class WhisperTranscriber:
         )
         feats = inp.input_features.to(self.device)
 
-        # Generate
+        # FIX: forced_decoder_ids chiem 4 tokens
+        # max_new_tokens phai <= 448 - 4 = 444
         gen_ids = self.model.generate(
             feats,
             forced_decoder_ids=self.forced_ids,
-            max_new_tokens=448,
+            max_new_tokens=444,          # FIX: 448-4=444 tranh tran
+            return_dict_in_generate=True,
+            output_scores=False,         # Khong dung output_scores
         )
-        texts = self.processor.batch_decode(gen_ids, skip_special_tokens=True)
+        sequences = gen_ids.sequences
+        texts = self.processor.batch_decode(sequences, skip_special_tokens=True)
 
-        # Confidence: forward pass voi generated tokens
+        # Confidence = ty le token real so voi max (nhanh, khong can forward pass)
+        # Token thuc = do dai sequence - 4 (special tokens)
+        max_content_tokens = 444
         results = []
-        for i, (gid, text) in enumerate(zip(gen_ids, texts)):
-            try:
-                fi = feats[i:i+1]
-                dec_in = gid[:-1].unsqueeze(0).to(self.device)
-                out    = self.model(input_features=fi, decoder_input_ids=dec_in)
-                logits = out.logits[0]               # (seq, vocab)
-                probs  = torch.softmax(logits, dim=-1)
-                tgt    = gid[1:].to(self.device)
-                n      = min(len(tgt), logits.shape[0])
-                if n > 0:
-                    sel = probs[:n].gather(1, tgt[:n].unsqueeze(1)).squeeze(1)
-                    non_sp = tgt[:n] < 50257
-                    conf = float(sel[non_sp].mean().cpu()) if non_sp.sum() > 0 \
-                           else float(sel.mean().cpu())
-                else:
-                    conf = 0.3
-            except Exception:
-                conf = 0.3
-            results.append({'text': text.strip(), 'confidence': conf})
+        for i, (seq, text) in enumerate(zip(sequences, texts)):
+            # Real tokens = seq len - 4 (bos + lang + task + notimestamps)
+            n_real = max(0, seq.shape[0] - 4)
+            # Confidence = 1 nếu có nhiều token, gần 0 nếu output rỗng
+            conf = min(1.0, n_real / max(10, len(text.split()) * 2 + 1))
+            # Boost nếu text dài (sign of successful transcription)
+            conf = conf * 0.7 + (0.3 if len(text.strip()) > 5 else 0.0)
+            results.append({'text': text.strip(), 'confidence': float(conf)})
         return results
+
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -213,13 +209,13 @@ def normalize_vi(text: str) -> str:
 
 def extract_audio_features(y: np.ndarray, sr: int = 16000) -> dict:
     """
-    20+ acoustic features:
+    20+ acoustic features - FAST version:
     - Signal quality: SNR, silence_ratio, clipping_ratio
     - Spectral: centroid, bandwidth, rolloff, ZCR
-    - MFCC: mean + std of first 13 coefficients
-    - Rhythm: tempo, beat_strength
-    - Pitch: mean, std, voiced_ratio
+    - MFCC: mean + std cua 13 coefficients
+    - RMS energy: mean + std
     - Duration
+    NOTE: Bỏ librosa.pyin (pitch) vì cực chậm O(n^2) ~5s/file
     """
     feats = {}
     n = len(y)
@@ -231,11 +227,11 @@ def extract_audio_features(y: np.ndarray, sr: int = 16000) -> dict:
 
     # ── SNR ──────────────────────────────────────────────────────
     frames = librosa.util.frame(y, frame_length=2048, hop_length=512)
-    fe     = np.mean(frames ** 2, axis=0)
-    thr    = 0.01 * (fe.max() + 1e-10)
-    s_e    = fe[fe >= thr].mean() if (fe >= thr).any() else 1e-10
-    n_e    = fe[fe < thr].mean()  if (fe < thr).any()  else 1e-10
-    feats['snr'] = float(np.clip(10 * np.log10((s_e + 1e-10) / (n_e + 1e-10)), -10, 60))
+    fe     = np.mean(frames ** 2, axis=0) + 1e-12
+    thr    = 0.01 * fe.max()
+    s_e    = fe[fe >= thr].mean() if (fe >= thr).any() else fe.mean()
+    n_e    = fe[fe < thr].mean()  if (fe < thr).any()  else 1e-12
+    feats['snr'] = float(np.clip(10 * np.log10(s_e / n_e), -10, 60))
 
     # ── Silence ratio ────────────────────────────────────────────
     intervals  = librosa.effects.split(y, top_db=40)
@@ -245,55 +241,47 @@ def extract_audio_features(y: np.ndarray, sr: int = 16000) -> dict:
     # ── Clipping ratio ───────────────────────────────────────────
     feats['clipping_ratio'] = float(np.mean(np.abs(y) > 0.99))
 
-    # ── Spectral features ────────────────────────────────────────
-    S = np.abs(librosa.stft(y))
-    feats['spectral_centroid_mean'] = float(librosa.feature.spectral_centroid(S=S, sr=sr).mean())
-    feats['spectral_centroid_std']  = float(librosa.feature.spectral_centroid(S=S, sr=sr).std())
-    feats['spectral_bandwidth_mean']= float(librosa.feature.spectral_bandwidth(S=S, sr=sr).mean())
-    feats['spectral_rolloff_mean']  = float(librosa.feature.spectral_rolloff(S=S, sr=sr).mean())
-    feats['zcr_mean']               = float(librosa.feature.zero_crossing_rate(y).mean())
-    feats['zcr_std']                = float(librosa.feature.zero_crossing_rate(y).std())
+    # ── Spectral features (dung STFT chung) ──────────────────────
+    S   = np.abs(librosa.stft(y, n_fft=1024, hop_length=256))
+    sc  = librosa.feature.spectral_centroid(S=S, sr=sr)[0]
+    sb  = librosa.feature.spectral_bandwidth(S=S, sr=sr)[0]
+    sr2 = librosa.feature.spectral_rolloff(S=S, sr=sr)[0]
+    zcr = librosa.feature.zero_crossing_rate(y)[0]
 
-    # ── MFCC (first 13) ──────────────────────────────────────────
-    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
+    feats['spectral_centroid_mean'] = float(sc.mean())
+    feats['spectral_centroid_std']  = float(sc.std())
+    feats['spectral_bandwidth_mean']= float(sb.mean())
+    feats['spectral_rolloff_mean']  = float(sr2.mean())
+    feats['zcr_mean']               = float(zcr.mean())
+    feats['zcr_std']                = float(zcr.std())
+
+    # ── MFCC (13 coefficients, moi cai co mean + std) ────────────
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13,
+                                 n_fft=1024, hop_length=256)
     for i in range(13):
         feats[f'mfcc{i+1}_mean'] = float(mfcc[i].mean())
         feats[f'mfcc{i+1}_std']  = float(mfcc[i].std())
 
     # ── RMS energy ───────────────────────────────────────────────
-    rms = librosa.feature.rms(y=y)
+    rms = librosa.feature.rms(y=y, frame_length=1024, hop_length=256)[0]
     feats['rms_mean'] = float(rms.mean())
     feats['rms_std']  = float(rms.std())
 
-    # ── Pitch (pyin) ─────────────────────────────────────────────
-    try:
-        f0, voiced_flag, _ = librosa.pyin(
-            y, fmin=librosa.note_to_hz('C2'),
-            fmax=librosa.note_to_hz('C7'), sr=sr
-        )
-        f0_valid = f0[voiced_flag] if voiced_flag is not None else np.array([])
-        feats['pitch_mean']      = float(f0_valid.mean()) if len(f0_valid) > 0 else 0.0
-        feats['pitch_std']       = float(f0_valid.std())  if len(f0_valid) > 1 else 0.0
-        feats['voiced_ratio']    = float(voiced_flag.mean()) if voiced_flag is not None else 0.0
-    except Exception:
-        feats['pitch_mean']   = 0.0
-        feats['pitch_std']    = 0.0
-        feats['voiced_ratio'] = 0.0
+    # ── Voiced ratio (fast: dung energy thresholding, khong pyin) ──
+    voiced_frames = (fe > thr).astype(float)
+    feats['voiced_ratio'] = float(voiced_frames.mean())
 
-    # ── Tempo ────────────────────────────────────────────────────
-    try:
-        onset_env = librosa.onset.onset_strength(y=y, sr=sr)
-        tempo_val = librosa.feature.rhythm.tempo(onset_envelope=onset_env, sr=sr)
-        feats['tempo'] = float(tempo_val[0]) if hasattr(tempo_val, '__len__') else float(tempo_val)
-    except Exception:
-        feats['tempo'] = 0.0
+    # ── Speaking rate proxy (voiced transitions / duration) ──────
+    transitions = np.diff((fe > thr).astype(int))
+    feats['speaking_rate'] = float(np.sum(transitions > 0) / (duration + 1e-6))
 
     return feats
 
 
+
 def extract_all_features(df: pd.DataFrame, audio_dir: Path,
                           whisper: WhisperTranscriber,
-                          batch_size: int = 8) -> pd.DataFrame:
+                          batch_size: int = 16) -> pd.DataFrame:
     # Build lookup
     lookup = build_audio_lookup(audio_dir)
     if not lookup:
@@ -327,14 +315,14 @@ def extract_all_features(df: pd.DataFrame, audio_dir: Path,
         if not batch_audio:
             continue
 
-        # Whisper transcribe
+        # ── GPU: Whisper batch transcribe ──
         try:
             w_results = whisper.transcribe_batch(batch_audio)
         except Exception as e:
             print(f"\n[!] Whisper error: {e}")
             w_results = [{'text': '', 'confidence': 0.0}] * len(batch_audio)
 
-        # Extract features
+        # ── CPU: librosa features (sau khi GPU xong) ──
         for y, row, wr in zip(batch_audio, batch_meta, w_results):
             try:
                 af = extract_audio_features(y, SAMPLE_RATE)
@@ -349,7 +337,7 @@ def extract_all_features(df: pd.DataFrame, audio_dir: Path,
                     except Exception:
                         wer_v, cer_v = 1.0, 1.0
                 elif not hyp and not ref:
-                    wer_v, cer_v = 0.0, 0.0   # ca hai rong → match
+                    wer_v, cer_v = 0.0, 0.0
                 else:
                     wer_v, cer_v = 1.0, 1.0
 
@@ -360,6 +348,7 @@ def extract_all_features(df: pd.DataFrame, audio_dir: Path,
                 af['hyp_len']      = len(hyp.split())
                 af['ref_len']      = len(ref.split())
                 af['len_diff']     = abs(af['hyp_len'] - af['ref_len'])
+                af['whisper_text_len'] = len(wr['text'])
 
                 af['file_basename'] = row['file_basename']
                 af['username']      = row.get('username', 'unknown')
@@ -370,16 +359,18 @@ def extract_all_features(df: pd.DataFrame, audio_dir: Path,
             except Exception:
                 pass
 
+        # Giai phong GPU sau moi batch
         if DEVICE == "cuda":
             torch.cuda.empty_cache()
 
     feat_df = pd.DataFrame(records)
     print(f"[+] Extracted: {len(feat_df)} samples x {len(feat_df.columns)} cols")
-    # In kiem tra WER
     if 'wer' in feat_df.columns:
-        good_wer = (feat_df['wer'] < 1.0).mean()
-        print(f"    WER < 1.0: {good_wer*100:.1f}% samples (>0% = Whisper hoat dong)")
+        good = (feat_df['wer'] < 1.0).mean()
+        print(f"    WER < 1.0: {good*100:.1f}% | Avg WER: {feat_df['wer'].mean():.4f}")
+        print(f"    Avg Whisper_conf: {feat_df['whisper_conf'].mean():.4f}")
     return feat_df
+
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -633,7 +624,7 @@ def main():
             model_name="openai/whisper-small",
             device=DEVICE
         )
-        BATCH = 8 if DEVICE == "cuda" else 2
+        BATCH = 16 if DEVICE == "cuda" else 2  # T4 xu ly 16 audio/batch
         feat_df = extract_all_features(df, AUDIO_DIR, whisper, batch_size=BATCH)
 
         del whisper; gc.collect()

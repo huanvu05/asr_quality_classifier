@@ -229,7 +229,7 @@ class WhisperFeatureExtractor:
         print(f"  ✓ Whisper loaded | Language: Vietnamese")
 
     @torch.no_grad()
-    def transcribe_batch(self, audio_list: list[np.ndarray]) -> list[dict]:
+    def transcribe_batch(self, audio_list: list) -> list:
         """
         audio_list: list of numpy arrays (16kHz mono)
         Returns: list of {'text': str, 'confidence': float}
@@ -244,41 +244,61 @@ class WhisperFeatureExtractor:
         input_features = inputs.input_features.to(self.device).to(torch.float32)
 
         try:
-            # Generate với output_scores để lấy confidence
-            generated = self.model.generate(
+            # NOTE: output_scores bị deprecated trong transformers>=4.40
+            # Dùng generate thường + lấy confidence từ logits riêng
+            generated_ids = self.model.generate(
                 input_features,
                 forced_decoder_ids=self.forced_ids,
-                return_dict_in_generate=True,
-                output_scores=True,
                 max_new_tokens=448,
             )
-            sequences = generated.sequences
-            scores    = generated.scores  # tuple of (vocab_size,) tensors per step
+            texts = self.processor.batch_decode(generated_ids, skip_special_tokens=True)
 
-            # Decode text
-            texts = self.processor.batch_decode(sequences, skip_special_tokens=True)
+            # Tính confidence bằng cách forward pass với generated tokens
+            # → Lấy mean softmax probability của các token được chọn
+            confidences = []
+            for i, (gen_ids, audio) in enumerate(zip(generated_ids, audio_list)):
+                try:
+                    # Tạo decoder input từ generated sequence
+                    dec_input = gen_ids[:-1].unsqueeze(0).to(self.device)
+                    enc_input = input_features[i:i+1]
 
-            # Tính confidence: mean của max log-prob per token step
-            if scores:
-                log_probs = []
-                for step_scores in scores:
-                    # step_scores: (batch, vocab)
-                    step_log_probs = torch.log_softmax(step_scores, dim=-1)
-                    max_log_probs  = step_log_probs.max(dim=-1).values  # (batch,)
-                    log_probs.append(max_log_probs.cpu().numpy())
-                log_probs_arr = np.array(log_probs)  # (steps, batch)
-                confidences   = np.exp(log_probs_arr.mean(axis=0))  # (batch,) → [0,1]
-            else:
-                confidences = np.full(len(texts), 0.5)
+                    with torch.no_grad():
+                        out = self.model(
+                            input_features=enc_input,
+                            decoder_input_ids=dec_input,
+                        )
+                        # logits shape: (1, seq_len, vocab)
+                        logits = out.logits[0]  # (seq_len, vocab)
+                        probs  = torch.softmax(logits, dim=-1)
+                        # Lấy prob của token thực tế được chọn
+                        target_ids = gen_ids[1:].to(self.device)  # shift
+                        n = min(len(target_ids), logits.shape[0])
+                        if n > 0:
+                            selected_probs = probs[:n].gather(
+                                1, target_ids[:n].unsqueeze(1)
+                            ).squeeze(1)
+                            # Lọc bỏ special tokens (id < 50257)
+                            non_special = target_ids[:n] < 50257
+                            if non_special.sum() > 0:
+                                conf = float(selected_probs[non_special].mean().cpu())
+                            else:
+                                conf = float(selected_probs.mean().cpu())
+                        else:
+                            conf = 0.3
+                    confidences.append(conf)
+                except Exception:
+                    confidences.append(0.3)
 
             for text, conf in zip(texts, confidences):
                 results.append({'text': text.strip(), 'confidence': float(conf)})
 
         except Exception as e:
+            print(f"\n[!] Whisper batch error: {e}")
             for _ in audio_list:
                 results.append({'text': '', 'confidence': 0.0})
 
         return results
+
 
 
 def extract_all_features(df: pd.DataFrame, audio_dir: Path,
@@ -511,64 +531,148 @@ def get_lgbm_params(y: np.ndarray, use_gpu: bool = False) -> dict:
     return params
 
 
-def train_evaluate(feat_df: pd.DataFrame, feature_cols: list, label_col: str,
-                   strategy_name: str,
-                   y_train_col: str = None,
-                   use_gpu: bool = False) -> dict:
+def compute_annotator_features_on_train(df_train: pd.DataFrame, df_val: pd.DataFrame,
+                                         global_target_mean: float) -> tuple:
     """
-    5-Fold CV với LightGBM.
-    - feature_cols : cột features
-    - label_col    : cột nhãn để EVALUATE
-    - y_train_col  : cột nhãn để TRAIN (nếu khác label_col → soft/MV label)
+    Tính annotator features CHỈ từ train fold, áp dụng cho val fold.
+    → Tránh data leakage của transcript_consensus_ratio.
+    
+    Trả về (df_train_with_feats, df_val_with_feats)
     """
-    df_clean = feat_df.dropna(subset=feature_cols + [label_col]).copy()
-    X  = df_clean[feature_cols].values.astype(np.float32)
-    y  = df_clean[label_col].values.astype(int)
-    y_tr = df_clean[y_train_col].values.astype(int) if y_train_col else y
+    eps = 1e-6
 
-    print(f"\n  ▶ {strategy_name}  ({len(X)} samples, {len(feature_cols)} features)")
+    def safe_logit(p):
+        p = np.clip(p, eps, 1 - eps)
+        return np.log(p / (1 - p))
 
-    skf  = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
-    oof  = np.zeros(len(X))
-    params = get_lgbm_params(y, use_gpu=use_gpu)
+    global_logit = safe_logit(global_target_mean)
 
-    for fold, (tr_idx, val_idx) in enumerate(skf.split(X, y)):
-        sc = StandardScaler()
-        Xtr = sc.fit_transform(X[tr_idx])
-        Xvl = sc.transform(X[val_idx])
+    # Annotator stats từ TRAIN ONLY
+    user_stats = df_train.groupby('username').agg(
+        user_acceptance_rate=('target', 'mean')
+    ).reset_index()
+    user_stats['annotator_bias_logit'] = user_stats['user_acceptance_rate'].apply(
+        lambda r: safe_logit(r) - global_logit
+    )
+    max_bias = user_stats['annotator_bias_logit'].abs().max() + eps
+    user_stats['annotator_credibility'] = 1 - (
+        user_stats['annotator_bias_logit'].abs() / max_bias
+    )
+
+    # Transcript consensus từ TRAIN ONLY
+    trans_stats = df_train.groupby('transcript').agg(
+        transcript_n_versions=('target', 'count'),
+        transcript_usable_votes=('target', 'sum')
+    ).reset_index()
+    trans_stats['transcript_consensus_ratio'] = (
+        trans_stats['transcript_usable_votes'] / trans_stats['transcript_n_versions']
+    )
+    trans_stats['transcript_ambiguity'] = 1 - abs(
+        trans_stats['transcript_consensus_ratio'] - 0.5
+    ) * 2
+
+    # Merge vào train và val
+    def _merge(df):
+        df = df.merge(user_stats[['username', 'user_acceptance_rate',
+                                   'annotator_bias_logit', 'annotator_credibility']],
+                      on='username', how='left')
+        df = df.merge(trans_stats[['transcript', 'transcript_n_versions',
+                                    'transcript_consensus_ratio', 'transcript_ambiguity']],
+                      on='transcript', how='left')
+        # Val có thể có transcript mới → fillna bằng global prior
+        df['transcript_consensus_ratio'] = df['transcript_consensus_ratio'].fillna(
+            global_target_mean
+        )
+        df['transcript_ambiguity']       = df['transcript_ambiguity'].fillna(0.5)
+        df['transcript_n_versions']      = df['transcript_n_versions'].fillna(1)
+        df['user_acceptance_rate']       = df['user_acceptance_rate'].fillna(global_target_mean)
+        df['annotator_bias_logit']       = df['annotator_bias_logit'].fillna(0.0)
+        df['annotator_credibility']      = df['annotator_credibility'].fillna(0.5)
+        return df
+
+    return _merge(df_train.copy()), _merge(df_val.copy())
+
+
+def train_evaluate_no_leak(feat_df: pd.DataFrame, feature_cols: list,
+                            label_col: str, strategy_name: str,
+                            use_annotator_feats: bool = True,
+                            y_train_col: str = None,
+                            use_gpu: bool = False) -> dict:
+    """
+    5-Fold CV KHÔNG CÓ DATA LEAKAGE.
+    Annotator + transcript features được tính TRONG TỪNG FOLD chỉ từ train data.
+    """
+    # Base audio features (không bị leak)
+    base_audio_cols = [c for c in ['snr', 'silence_ratio', 'wer', 'cer',
+                                    'length_ratio', 'duration', 'whisper_conf']
+                       if c in feat_df.columns]
+    # Annotator feature names (sẽ được tính trong fold)
+    ann_feat_cols = ['user_acceptance_rate', 'annotator_bias_logit', 'annotator_credibility',
+                     'transcript_consensus_ratio', 'transcript_ambiguity', 'transcript_n_versions']
+
+    all_feat_cols = base_audio_cols + (ann_feat_cols if use_annotator_feats else [])
+    all_feat_cols = [c for c in all_feat_cols if c in feat_df.columns or use_annotator_feats]
+
+    df_clean = feat_df.dropna(subset=base_audio_cols + [label_col]).copy()
+    global_mean = df_clean['target'].mean()
+
+    print(f"\n  ▶ {strategy_name}  ({len(df_clean)} samples, "
+          f"{len(base_audio_cols) + (len(ann_feat_cols) if use_annotator_feats else 0)} features)")
+
+    skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    oof = np.zeros(len(df_clean))
+    params = get_lgbm_params(df_clean[label_col].values.astype(int), use_gpu=use_gpu)
+
+    idx_arr = np.arange(len(df_clean))
+
+    for fold, (tr_idx, val_idx) in enumerate(skf.split(idx_arr, df_clean[label_col].values)):
+        df_tr  = df_clean.iloc[tr_idx].copy()
+        df_vl  = df_clean.iloc[val_idx].copy()
+
+        if use_annotator_feats:
+            df_tr, df_vl = compute_annotator_features_on_train(
+                df_tr, df_vl, global_mean
+            )
+
+        # Build feature matrix sau khi đã có annotator features
+        actual_cols = [c for c in all_feat_cols if c in df_tr.columns]
+        Xtr = df_tr[actual_cols].fillna(0).values.astype(np.float32)
+        Xvl = df_vl[actual_cols].fillna(0).values.astype(np.float32)
+        ytr = df_tr[y_train_col if y_train_col else label_col].values.astype(int)
+        yvl = df_vl[label_col].values.astype(int)
+
+        sc  = StandardScaler()
+        Xtr = sc.fit_transform(Xtr)
+        Xvl = sc.transform(Xvl)
 
         model = lgb.LGBMClassifier(**params)
-        model.fit(Xtr, y_tr[tr_idx],
-                  eval_set=[(Xvl, y[val_idx])],
+        model.fit(Xtr, ytr,
+                  eval_set=[(Xvl, yvl)],
                   callbacks=[lgb.early_stopping(100, verbose=False),
                               lgb.log_evaluation(-1)])
         oof[val_idx] = model.predict_proba(Xvl)[:, 1]
         print(f"    Fold {fold+1}/{N_FOLDS} ✓", end='\r')
     print()
 
-    # Tối ưu threshold
+    y_eval = df_clean[label_col].values.astype(int)
     best_t, best_f1 = 0.5, 0.0
     for t in np.arange(0.05, 0.95, 0.01):
-        f1 = f1_score(y, (oof >= t).astype(int), average='macro', zero_division=0)
+        f1 = f1_score(y_eval, (oof >= t).astype(int), average='macro', zero_division=0)
         if f1 > best_f1:
             best_f1, best_t = f1, t
 
     preds  = (oof >= best_t).astype(int)
-    auc    = roc_auc_score(y, oof)
-    report = classification_report(y, preds, output_dict=True, zero_division=0)
-
+    auc    = roc_auc_score(y_eval, oof)
+    report = classification_report(y_eval, preds, output_dict=True, zero_division=0)
     print(f"    MacroF1={best_f1:.4f} | AUC={auc:.4f} | Threshold={best_t:.2f}")
+
     return {
-        'strategy'   : strategy_name,
-        'n'          : len(X),
-        'macro_f1'   : best_f1,
-        'auc'        : auc,
-        'threshold'  : best_t,
-        'f1_0'       : report['0']['f1-score'],
-        'f1_1'       : report['1']['f1-score'],
-        'oof'        : oof,
-        'y'          : y,
+        'strategy': strategy_name, 'n': len(df_clean),
+        'macro_f1': best_f1, 'auc': auc, 'threshold': best_t,
+        'f1_0': report['0']['f1-score'], 'f1_1': report['1']['f1-score'],
+        'oof': oof, 'y': y_eval,
     }
+
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -674,48 +778,39 @@ def main():
     print(f"\n  Annotator rejection rates:")
     print(user_tbl.sort_values('reject_%', ascending=False)[['total','reject_%']].to_string())
 
-    # ── 5. Train: 4 chiến lược ──
-    print(f"\n{'='*60}")
-    print("  TRAINING — 4 CHIẾN LƯỢC")
-    print(f"  GPU LightGBM: {'✅' if USE_GPU_LGB else '❌'}")
-    print(f"{'='*60}")
+    # ── 5. Train: 3 chiến lược (NO DATA LEAKAGE) ──
+    print(f"\n{'='*65}")
+    print("  TRAINING — KET QUA THUC SU (Khong Data Leakage)")
+    print(f"  GPU LightGBM: {'Yes' if USE_GPU_LGB else 'No'}")
+    print("  transcript_consensus_ratio tinh TRONG TUNG FOLD (train data only)")
+    print(f"{'='*65}")
 
     results = []
 
-    # A. Baseline: chỉ audio features
-    results.append(train_evaluate(
-        feat_df, AUDIO_FEATURES, 'target',
-        'A_Baseline_AudioOnly', use_gpu=USE_GPU_LGB
-    ))
-
-    # B. Audio + Whisper confidence (thêm whisper_conf đã có trong AUDIO_FEATURES)
-    # (whisper_conf đã trong AUDIO_FEATURES rồi, nên A đã bao gồm)
-
-    # C. Full: Audio + Annotator features
-    full_features = AUDIO_FEATURES + ANNOTATOR_FEATURES
-    full_features = [f for f in full_features if f in feat_df.columns]
-    results.append(train_evaluate(
-        feat_df, full_features, 'target',
-        'C_Audio+AnnotatorFeatures', use_gpu=USE_GPU_LGB
-    ))
-
-    # D. Full features + Majority Voting labels (train với MV, eval với original)
-    results.append(train_evaluate(
-        feat_df, full_features, 'target',
-        'D_AnnotatorFeatures+MVLabel',
-        y_train_col='label_mv',
+    # A. Baseline: chi audio features, khong annotator
+    results.append(train_evaluate_no_leak(
+        feat_df, [], 'target',
+        'A_Baseline_AudioOnly',
+        use_annotator_feats=False,
         use_gpu=USE_GPU_LGB
     ))
 
-    # E. High-consensus only (transcript_ambiguity < 0.3)
-    df_hc = feat_df[feat_df['transcript_ambiguity'] < 0.3].copy()
-    if len(df_hc) >= 200:
-        results.append(train_evaluate(
-            df_hc, full_features, 'target',
-            'E_HighConsensusOnly', use_gpu=USE_GPU_LGB
-        ))
-    else:
-        print(f"\n  [SKIP] E_HighConsensus: chỉ {len(df_hc)} mẫu, không đủ")
+    # C. Audio + Annotator features (leak-free)
+    results.append(train_evaluate_no_leak(
+        feat_df, [], 'target',
+        'C_Audio+Annotator (no-leak)',
+        use_annotator_feats=True,
+        use_gpu=USE_GPU_LGB
+    ))
+
+    # D. Annotator features + Majority Voting labels (leak-free)
+    results.append(train_evaluate_no_leak(
+        feat_df, [], 'target',
+        'D_Annotator+MV_Label (no-leak)',
+        use_annotator_feats=True,
+        y_train_col='label_mv',
+        use_gpu=USE_GPU_LGB
+    ))
 
     # ── 6. Tổng kết ──
     print(f"\n{'='*70}")

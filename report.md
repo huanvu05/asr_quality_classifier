@@ -1,7 +1,7 @@
 # BÁO CÁO ĐÁNH GIÁ CHẤT LƯỢNG MÔ HÌNH BỘ PHÂN LOẠI CHẤT LƯỢNG DỮ LIỆU ASR
 **Dự án:** Tự động phân loại cặp Âm thanh + Bản ghi (Usable / Unusable)  
 **Môi trường thực nghiệm:** Kaggle (Dual T4 GPUs) & Cục bộ  
-**Học viên:** Thực tập sinh Nhóm ASR  
+**Học viên:** Vũ Văn Huân
 
 ---
 
@@ -99,3 +99,16 @@ Kết quả điểm F1-Macro tiệm cận **0.57** (thấp hơn mục tiêu lý 
    * Chỉ đưa vào huấn luyện các mẫu có độ đồng thuận tuyệt đối (tỷ lệ đồng thuận = 1.0 hoặc 0.0). Thực nghiệm lọc bỏ các mẫu có ambiguity > 0.3 sẽ giúp cải thiện rõ rệt khả năng hội tụ và độ chính xác của mô hình phân loại.
 3. **Cấu hình tối ưu bộ nhớ khi chạy Feature Extraction:**
    * Kích hoạt tham số `PYTORCH_ALLOC_CONF=expandable_segments:True` hoặc giảm batch size xuống mức 8–16 khi chạy trích xuất Whisper trên GPU cấu hình thấp để tránh lỗi OOM, đảm bảo 100% vector đặc trưng sâu được sinh ra trọn vẹn.
+
+---
+
+## VII. NHẬT KÝ THỬ NGHIỆM VÀ CẤU TRÚC THƯ MỤC NỘP BÀI (EXPERIMENTAL LOGS)
+Để dự án có cấu trúc mã nguồn chuyên nghiệp, dễ đọc và gọn gàng phục vụ bước thẩm định, các file thử nghiệm huấn luyện khác nhau trong suốt quá trình nghiên cứu đã được phân loại và sắp xếp gọn gàng vào thư mục [experiments/](experiments/). Dưới đây là các thử nghiệm đã được triển khai trước khi đi đến kiến trúc mô hình cuối cùng:
+
+1. **WavLM End-to-End ([train_wavlm_end2end.py](experiments/train_wavlm_end2end.py)):** Thử nghiệm huấn luyện WavLM trích xuất đặc trưng sâu từ layer trung gian (Layer 6) kết hợp với MLP.
+2. **Handcrafted + Deep Features ([train_hybrid.py](experiments/train_hybrid.py)):** Ghép nối đặc trưng acoustic vật lý của `librosa` (10 chiều) với Whisper/Wav2Vec2 embeddings (512 chiều) để tăng cường độ hội tụ.
+3. **Data-Centric & Dual-Weighting ([train_hybrid_datacentric.py](experiments/train_hybrid_datacentric.py)):** Thuật toán XGBoost kết hợp cơ chế gán trọng số mẫu kép (Dual Sample Weighting) — phạt nặng mẫu nhiễu (mâu thuẫn gán nhãn, trọng số 0.3) và tăng trọng số bù mất cân bằng lớp.
+4. **Annotator-Aware & Majority Voting ([train_annotator_aware.py](experiments/train_annotator_aware.py)):** Mô hình hóa hành vi của 7 người đánh nhãn làm đặc trưng đầu vào, kết hợp làm sạch nhãn bằng Majority Voting.
+5. **Deep Audio Fusion ([train_deep_audio_fusion.py](experiments/train_deep_audio_fusion.py)):** Trộn lẫn đặc trưng phổ Mel và Wav2Vec2 qua các khối mạng Fully Connected sâu.
+6. **Mô hình nộp cuối cùng ([run_kaggle.py](run_kaggle.py)):** Mô hình đa phương thức (Multimodal Stacking Ensemble) chạy trên Kaggle kết hợp đặc trưng sâu Whisper, đặc trưng acoustic vật lý, và đặc trưng hành vi annotator được tối ưu hóa qua mô hình LightGBM + MLP.
+

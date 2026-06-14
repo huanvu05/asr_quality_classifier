@@ -279,7 +279,7 @@ def train_neural_model(
     pos_weight = torch.tensor([config.training.pos_class_weight], device=config.device)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     
-    scheduler = ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3, verbose=True)
+    scheduler = ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3)
     
     best_val_f1 = -1.0
     best_val_loss = float("inf")

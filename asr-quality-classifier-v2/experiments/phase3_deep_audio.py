@@ -73,7 +73,7 @@ def run_deep_audio() -> Dict[str, Any]:
         )
         
         # Instantiate model in audio_only mode
-        model = ASRQualityClassifier(config, mode="audio_only")
+        model = ASRQualityClassifier(config, mode="audio_only").to(config.device)
         
         # Path to save fold model checkpoint
         checkpoint_path = config.paths.model_dir / f"deep_audio_fold{fold+1}.pt"

@@ -21,17 +21,36 @@ def resolve_audio_path(file_path: str, audio_dir: Path) -> Optional[Path]:
     """
     Resolves the absolute path to an audio file on disk.
     Checks audio_dir directly and audio_dir/data2.
+    Also handles paths recursively if mounted from Kaggle.
     """
-    # Check directly under audio_dir
+    # 1. Direct check
     path1 = audio_dir / file_path
     if path1.exists():
         return path1
     
-    # Check under audio_dir / "data2"
+    # 2. Check under "data2" (Azure structure)
     path2 = audio_dir / "data2" / file_path
     if path2.exists():
         return path2
-    
+        
+    # 3. Aggressive recursive search (for Kaggle datasets where structure might be flattened)
+    # E.g. file_path is "folder1/audio.wav", but Kaggle mounted it as "/kaggle/input/dataset/folder1/audio.wav"
+    # We search the parent of audio_dir just in case.
+    search_base = audio_dir.parent
+    try:
+        # Assuming file_path looks like "folder_name/file.wav"
+        folder_name, file_name = os.path.split(file_path)
+        found = list(search_base.glob(f"**/{folder_name}/{file_name}"))
+        if found:
+            return found[0]
+        
+        # If still not found, search just by file_name
+        found = list(search_base.glob(f"**/{file_name}"))
+        if found:
+            return found[0]
+    except Exception:
+        pass
+        
     return None
 
 def download_file_from_azure(

@@ -45,6 +45,10 @@ def extract_chunk(df_chunk: pd.DataFrame, gpu_id: int, config_copy) -> dict:
         "indices": df_chunk.index.values
     }
     
+    if len(df_chunk) == 0:
+        logger.warning(f"[GPU {gpu_id}] Received an empty chunk. Skipping.")
+        return results
+        
     # Process sequentially (batch size 1 or small batch to avoid OOM on 30s audio)
     batch_size = 8
     num_batches = math.ceil(len(df_chunk) / batch_size)
@@ -72,10 +76,14 @@ def extract_chunk(df_chunk: pd.DataFrame, gpu_id: int, config_copy) -> dict:
             results["audio_pools"].append(a_pool.cpu().numpy())
             results["text_pools"].append(t_pool.cpu().numpy())
             
-    # Concatenate results
-    results["audio_pools"] = np.concatenate(results["audio_pools"], axis=0)
-    results["text_pools"] = np.concatenate(results["text_pools"], axis=0)
-    
+    # Concatenate results if not empty
+    if results["audio_pools"]:
+        results["audio_pools"] = np.concatenate(results["audio_pools"], axis=0)
+        results["text_pools"] = np.concatenate(results["text_pools"], axis=0)
+    else:
+        results["audio_pools"] = np.array([])
+        results["text_pools"] = np.array([])
+        
     logger.info(f"[GPU {gpu_id}] Completed chunk.")
     return results
 

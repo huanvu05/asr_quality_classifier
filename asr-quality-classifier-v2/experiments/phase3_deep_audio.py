@@ -89,7 +89,7 @@ def run_deep_audio() -> Dict[str, Any]:
         
         # Evaluate model on validation set to collect logits
         # Re-load best checkpoint to evaluate
-        checkpoint = torch.load(str(checkpoint_path), map_location=config.device)
+        checkpoint = torch.load(str(checkpoint_path), map_location=config.device, weights_only=False)
         model.load_state_dict(checkpoint["model_state_dict"])
         
         from torch.utils.data import DataLoader

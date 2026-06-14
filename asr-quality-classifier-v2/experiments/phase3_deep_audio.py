@@ -112,7 +112,12 @@ def run_deep_audio() -> Dict[str, Any]:
                 txs = batch["texts"]
                 ac = batch["acoustic_feats"].to(config.device)
                 cm = batch["crossmodal_feats"].to(config.device)
-                logits = model(wfs, txs, ac, cm)
+                
+                audio_pools = batch.get("audio_pools")
+                if audio_pools is not None:
+                    audio_pools = audio_pools.to(config.device)
+                    
+                logits = model(wfs, txs, ac, cm, precomputed_audio_pool=audio_pools)
                 val_logits.append(logits.cpu().numpy())
                 
         oof_logits[val_idx] = np.concatenate(val_logits)

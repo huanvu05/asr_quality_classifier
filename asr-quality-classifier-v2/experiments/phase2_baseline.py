@@ -6,6 +6,8 @@ and trains a LightGBM classifier using 5-fold GroupKFold.
 """
 
 import os
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np

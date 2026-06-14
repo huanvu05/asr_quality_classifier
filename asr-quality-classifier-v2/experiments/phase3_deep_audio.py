@@ -5,9 +5,13 @@ Trains ASRQualityClassifier in "audio_only" mode (WavLM + Handcrafted Acoustic F
 """
 
 import os
+import sys
 import numpy as np
 import pandas as pd
 import torch
+
+# Add the project root to the Python path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.config import config, logger
 from src.data_loader import load_data, get_kfold_splits

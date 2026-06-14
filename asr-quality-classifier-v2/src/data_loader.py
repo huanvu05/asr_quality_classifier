@@ -195,6 +195,14 @@ def load_data(config: Config, sync_azure: bool = False) -> pd.DataFrame:
             f"{df.iloc[missing_indices[:5]]['file_path'].tolist()}"
         )
         df = df.dropna(subset=["absolute_path"]).reset_index(drop=True)
+        
+    if len(df) == 0:
+        raise RuntimeError(
+            f"FATAL ERROR: Dataset is completely empty after path resolution!\n"
+            f"Expected to find audio files inside: {config.paths.audio_dir}\n"
+            f"Please check your Kaggle Dataset structure. Make sure the audio folders "
+            f"(like 'data2' or 'folder1') are actually present inside the mounted directory."
+        )
     
     # Compute duration for each transcript to help filter/validate
     logger.info(f"Dataset successfully loaded. Total rows: {len(df)}.")

@@ -62,7 +62,18 @@ class PathConfig:
             input_base = Path("/kaggle/input")
             found_csv = list(input_base.glob("**/training.csv"))
             
-            if found_csv:
+            # Check if data is already in the working directory (e.g. from git clone)
+            working_csv = list(Path("/kaggle/working").glob("**/data/transcripts/training.csv"))
+            
+            if working_csv:
+                 # Data is inside the cloned repo
+                 self.labels_csv = working_csv[0]
+                 self.data_dir = self.labels_csv.parent.parent
+                 
+                 data2_dir = self.data_dir / "audio" / "data2"
+                 self.audio_dir = data2_dir if data2_dir.exists() else self.data_dir / "audio"
+                 logger.info(f"Auto-detected local Kaggle working dataset at: {self.data_dir}, Audio at: {self.audio_dir}")
+            elif found_csv:
                 # Dataset is mounted manually
                 self.labels_csv = found_csv[0]
                 self.data_dir = self.labels_csv.parent.parent if self.labels_csv.parent.name == "transcripts" else self.labels_csv.parent
@@ -70,7 +81,7 @@ class PathConfig:
                 # Look for data2 directory specifically
                 data2_dir = self.data_dir / "audio" / "data2"
                 self.audio_dir = data2_dir if data2_dir.exists() else self.data_dir / "audio"
-                logger.info(f"Auto-detected Kaggle dataset at: {self.data_dir}, Audio at: {self.audio_dir}")
+                logger.info(f"Auto-detected Kaggle input dataset at: {self.data_dir}, Audio at: {self.audio_dir}")
             else:
                 # Fallback to Azure download location
                 self.data_dir = Path("/kaggle/working/data")

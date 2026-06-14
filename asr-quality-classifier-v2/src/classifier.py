@@ -207,7 +207,7 @@ class TabularLGBMClassifier:
         """Saves the LightGBM model to disk."""
         if self.model is None:
             raise ValueError("No model to save.")
-        os.makedirs(os.path.parent(path), exist_ok=True)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         joblib.dump(self.model, path)
         logger.info(f"LGBM model saved to {path}")
 

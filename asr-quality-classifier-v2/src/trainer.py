@@ -25,8 +25,7 @@ from src.audio_features import process_audio_file
 class ASRDataset(Dataset):
     """
     PyTorch Dataset for audio-transcript pairs.
-    Loads raw waveforms on-the-fly to save memory.
-    Handcrafted features are pre-computed and passed in.
+    Loads raw waveforms on-the-fly to save memory (if no precomputed pools are provided).
     """
 
     def __init__(
@@ -34,7 +33,9 @@ class ASRDataset(Dataset):
         df: pd.DataFrame,
         config: Config,
         acoustic_feats: np.ndarray,
-        crossmodal_feats: np.ndarray
+        crossmodal_feats: np.ndarray,
+        precomputed_audio_pools: Optional[np.ndarray] = None,
+        precomputed_text_pools: Optional[np.ndarray] = None
     ):
         self.df = df
         self.config = config
@@ -44,6 +45,9 @@ class ASRDataset(Dataset):
         
         self.acoustic_feats = acoustic_feats
         self.crossmodal_feats = crossmodal_feats
+        
+        self.precomputed_audio_pools = precomputed_audio_pools
+        self.precomputed_text_pools = precomputed_text_pools
         
         self.sample_rate = config.audio.sample_rate
         self.max_duration = config.audio.max_duration_sec
@@ -56,25 +60,36 @@ class ASRDataset(Dataset):
         text = self.texts[idx]
         label = self.labels[idx]
         
-        # Load raw audio waveform on the fly
-        try:
-            y, _ = librosa.load(
-                path, 
-                sr=self.sample_rate, 
-                mono=True, 
-                duration=self.max_duration
-            )
-        except Exception as e:
-            logger.error(f"Error reading audio file {path} inside dataset: {e}")
-            y = np.zeros(self.sample_rate, dtype=np.float32)  # 1 second of silence fallback
+        # Only load raw audio if we don't have offline embeddings
+        # This speeds up training 100x when using precomputed pools.
+        if self.precomputed_audio_pools is None:
+            try:
+                y, _ = librosa.load(
+                    path, 
+                    sr=self.sample_rate, 
+                    mono=True, 
+                    duration=self.max_duration
+                )
+            except Exception as e:
+                logger.error(f"Error reading audio file {path} inside dataset: {e}")
+                y = np.zeros(self.sample_rate, dtype=np.float32)  # 1 second of silence fallback
+        else:
+            y = np.array([]) # Empty array, will not be used
             
-        return {
+        item = {
             "waveform": y,
             "text": text,
             "acoustic_feat": torch.tensor(self.acoustic_feats[idx], dtype=torch.float32),
             "crossmodal_feat": torch.tensor(self.crossmodal_feats[idx], dtype=torch.float32),
             "label": label
         }
+        
+        if self.precomputed_audio_pools is not None:
+            item["audio_pool"] = torch.tensor(self.precomputed_audio_pools[idx], dtype=torch.float32)
+        if self.precomputed_text_pools is not None:
+            item["text_pool"] = torch.tensor(self.precomputed_text_pools[idx], dtype=torch.float32)
+            
+        return item
 
 def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Collates variable-length raw waveforms and text into lists."""
@@ -84,13 +99,20 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     crossmodal_feats = torch.stack([item["crossmodal_feat"] for item in batch])
     labels = torch.tensor([item["label"] for item in batch], dtype=torch.float32)
     
-    return {
+    result = {
         "waveforms": waveforms,
         "texts": texts,
         "acoustic_feats": acoustic_feats,
         "crossmodal_feats": crossmodal_feats,
         "labels": labels
     }
+    
+    if "audio_pool" in batch[0]:
+        result["audio_pools"] = torch.stack([item["audio_pool"] for item in batch])
+    if "text_pool" in batch[0]:
+        result["text_pools"] = torch.stack([item["text_pool"] for item in batch])
+        
+    return result
 
 def train_epoch(
     model: nn.Module,
@@ -115,10 +137,17 @@ def train_epoch(
         crossmodal_feats = batch["crossmodal_feats"].to(device)
         labels = batch["labels"].to(device)
         
+        audio_pools = batch.get("audio_pools")
+        text_pools = batch.get("text_pools")
+        
         optimizer.zero_grad()
         
         # Forward pass
-        logits = model(waveforms, texts, acoustic_feats, crossmodal_feats)
+        logits = model(
+            waveforms, texts, acoustic_feats, crossmodal_feats,
+            precomputed_audio_pool=audio_pools,
+            precomputed_text_pool=text_pools
+        )
         loss = criterion(logits, labels)
         
         # Backward & Optimize
@@ -168,7 +197,14 @@ def evaluate_model(
             crossmodal_feats = batch["crossmodal_feats"].to(device)
             labels = batch["labels"].to(device)
             
-            logits = model(waveforms, texts, acoustic_feats, crossmodal_feats)
+            audio_pools = batch.get("audio_pools")
+            text_pools = batch.get("text_pools")
+            
+            logits = model(
+                waveforms, texts, acoustic_feats, crossmodal_feats,
+                precomputed_audio_pool=audio_pools,
+                precomputed_text_pool=text_pools
+            )
             loss = criterion(logits, labels)
             
             total_loss += loss.item() * len(waveforms)

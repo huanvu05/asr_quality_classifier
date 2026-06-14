@@ -31,12 +31,17 @@ def run_deep_audio() -> Dict[str, Any]:
     cache_dir = config.paths.cache_dir
     ac_cache_path = cache_dir / "acoustic_features.npy"
     cm_cache_path = cache_dir / "crossmodal_features.npy"
+    wavlm_cache_path = cache_dir / "wavlm_embeddings.npy"
     
     if not (ac_cache_path.exists() and cm_cache_path.exists()):
-        raise FileNotFoundError("Cached features not found. Please run phase2_baseline.py first to extract and cache features.")
+        raise FileNotFoundError("Cached handcrafted features not found. Please run 'python experiments/phase2_baseline.py' first to extract them.")
+        
+    if not wavlm_cache_path.exists():
+        raise FileNotFoundError("Cached WavLM embeddings not found. Please run 'python experiments/extract_embeddings_multi_gpu.py' first.")
         
     ac_feats = np.load(ac_cache_path)
     cm_feats = np.load(cm_cache_path)
+    wavlm_feats = np.load(wavlm_cache_path)
     
     # 2. CV Splits
     splits = get_kfold_splits(df, config, group_col="folder")
@@ -56,13 +61,15 @@ def run_deep_audio() -> Dict[str, Any]:
             df_train, 
             config, 
             ac_feats[train_idx], 
-            cm_feats[train_idx]
+            cm_feats[train_idx],
+            precomputed_audio_pools=wavlm_feats[train_idx]
         )
         val_ds = ASRDataset(
             df_val, 
             config, 
             ac_feats[val_idx], 
-            cm_feats[val_idx]
+            cm_feats[val_idx],
+            precomputed_audio_pools=wavlm_feats[val_idx]
         )
         
         # Instantiate model in audio_only mode

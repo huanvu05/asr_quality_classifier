@@ -85,7 +85,9 @@ class ASRQualityClassifier(nn.Module):
         waveforms: List[np.ndarray],
         texts: List[str],
         acoustic_feats: torch.Tensor,
-        crossmodal_feats: torch.Tensor
+        crossmodal_feats: torch.Tensor,
+        precomputed_audio_pool: Optional[torch.Tensor] = None,
+        precomputed_text_pool: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Forward pass.
@@ -94,23 +96,36 @@ class ASRQualityClassifier(nn.Module):
             texts: List of transcript strings.
             acoustic_feats: Handcrafted features [Batch, 37]
             crossmodal_feats: Length features [Batch, 6]
+            precomputed_audio_pool: Offline WavLM embeddings [Batch, 768]. If provided, skips audio_encoder.
+            precomputed_text_pool: Offline PhoBERT embeddings [Batch, 768]. If provided, skips text_encoder.
         Returns:
             logits: [Batch] (raw logits before sigmoid)
         """
-        # Ensure handcrafted features are on the correct device
         device = self.config.device
         ac_tensor = acoustic_feats.to(device)
         cm_tensor = crossmodal_feats.to(device)
         
-        # 1. Forward through frozen encoders
-        audio_seq, audio_mask, audio_pool = self.audio_encoder(waveforms)
-        text_seq, text_mask, text_pool = self.text_encoder(texts)
+        # 1. Obtain Audio Embeddings
+        if precomputed_audio_pool is not None:
+            audio_pool = precomputed_audio_pool.to(device)
+            audio_seq, audio_mask = None, None # Alignment not supported with precomputed pools yet
+        else:
+            audio_seq, audio_mask, audio_pool = self.audio_encoder(waveforms)
+            
+        # 2. Obtain Text Embeddings
+        if precomputed_text_pool is not None:
+            text_pool = precomputed_text_pool.to(device)
+            text_seq, text_mask = None, None
+        else:
+            text_seq, text_mask, text_pool = self.text_encoder(texts)
         
-        # 2. Extract alignment vector if needed
+        # 3. Extract alignment vector if needed
         if self.mode in ["full", "crossmodal_only"]:
+            if audio_seq is None or text_seq is None:
+                raise ValueError("Cross-attention alignment requires raw waveforms and texts, not just precomputed pools.")
             alignment = self.alignment_head(audio_seq, audio_mask, text_seq, text_mask)
             
-        # 3. Concatenate features based on mode
+        # 4. Concatenate features based on mode
         features_to_concat = []
         
         if self.mode == "full":
@@ -124,7 +139,7 @@ class ASRQualityClassifier(nn.Module):
             
         x = torch.cat(features_to_concat, dim=1)
         
-        # 4. Predict
+        # 5. Predict
         logits = self.mlp(x).squeeze(-1)
         return logits
 

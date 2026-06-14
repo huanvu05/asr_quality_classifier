@@ -58,11 +58,22 @@ class PathConfig:
     def __post_init__(self):
         # Override for cloud environments
         if _IS_KAGGLE:
-            # We assume data is downloaded via Azure to the working directory.
-            # If a Kaggle Dataset is mounted later, this can be manually changed.
-            self.data_dir = Path("/kaggle/working/data")
-            self.labels_csv = self.data_dir / "transcripts" / "training.csv"
-            self.audio_dir = self.data_dir / "audio"
+            # Check if user manually mounted the dataset via Kaggle UI
+            input_base = Path("/kaggle/input")
+            found_csv = list(input_base.glob("**/training.csv"))
+            
+            if found_csv:
+                # Dataset is mounted manually
+                self.labels_csv = found_csv[0]
+                self.data_dir = self.labels_csv.parent.parent if self.labels_csv.parent.name == "transcripts" else self.labels_csv.parent
+                self.audio_dir = self.data_dir / "audio"
+                logger.info(f"Auto-detected Kaggle dataset at: {self.data_dir}")
+            else:
+                # Fallback to Azure download location
+                self.data_dir = Path("/kaggle/working/data")
+                self.labels_csv = self.data_dir / "transcripts" / "training.csv"
+                self.audio_dir = self.data_dir / "audio"
+                
             self.output_dir = Path("/kaggle/working/outputs")
             self.model_dir = Path("/kaggle/working/models")
             self.cache_dir = Path("/kaggle/working/.cache")

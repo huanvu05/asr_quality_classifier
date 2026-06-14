@@ -58,9 +58,11 @@ class PathConfig:
     def __post_init__(self):
         # Override for cloud environments
         if _IS_KAGGLE:
-            self.data_dir = Path("/kaggle/input/datasets/huanvu205/training")
-            self.labels_csv = self.data_dir / "training.csv"
-            self.audio_dir = Path("/kaggle/working/audio")
+            # We assume data is downloaded via Azure to the working directory.
+            # If a Kaggle Dataset is mounted later, this can be manually changed.
+            self.data_dir = Path("/kaggle/working/data")
+            self.labels_csv = self.data_dir / "transcripts" / "training.csv"
+            self.audio_dir = self.data_dir / "audio"
             self.output_dir = Path("/kaggle/working/outputs")
             self.model_dir = Path("/kaggle/working/models")
             self.cache_dir = Path("/kaggle/working/.cache")

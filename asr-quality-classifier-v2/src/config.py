@@ -66,8 +66,11 @@ class PathConfig:
                 # Dataset is mounted manually
                 self.labels_csv = found_csv[0]
                 self.data_dir = self.labels_csv.parent.parent if self.labels_csv.parent.name == "transcripts" else self.labels_csv.parent
-                self.audio_dir = self.data_dir / "audio"
-                logger.info(f"Auto-detected Kaggle dataset at: {self.data_dir}")
+                
+                # Look for data2 directory specifically
+                data2_dir = self.data_dir / "audio" / "data2"
+                self.audio_dir = data2_dir if data2_dir.exists() else self.data_dir / "audio"
+                logger.info(f"Auto-detected Kaggle dataset at: {self.data_dir}, Audio at: {self.audio_dir}")
             else:
                 # Fallback to Azure download location
                 self.data_dir = Path("/kaggle/working/data")

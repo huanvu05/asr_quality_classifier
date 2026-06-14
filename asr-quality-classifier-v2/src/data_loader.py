@@ -34,18 +34,20 @@ def resolve_audio_path(file_path: str, audio_dir: Path) -> Optional[Path]:
         return path2
         
     # 3. Aggressive recursive search (for Kaggle datasets where structure might be flattened)
-    # E.g. file_path is "folder1/audio.wav", but Kaggle mounted it as "/kaggle/input/dataset/folder1/audio.wav"
-    # We search the parent of audio_dir just in case.
     search_base = audio_dir.parent
     try:
         # Assuming file_path looks like "folder_name/file.wav"
-        folder_name, file_name = os.path.split(file_path)
-        found = list(search_base.glob(f"**/{folder_name}/{file_name}"))
+        # We need to search for that exact suffix ending.
+        # file_path in CSV is like: "50000420251102141639_000_ee165aea-b295-453b-9060-689dd51f6abe/clone8.wav"
+        
+        # Try to find any file matching the exact sub-path
+        found = list(search_base.rglob(file_path))
         if found:
             return found[0]
-        
-        # If still not found, search just by file_name
-        found = list(search_base.glob(f"**/{file_name}"))
+            
+        # If not, try just the filename
+        file_name = Path(file_path).name
+        found = list(search_base.rglob(file_name))
         if found:
             return found[0]
     except Exception:

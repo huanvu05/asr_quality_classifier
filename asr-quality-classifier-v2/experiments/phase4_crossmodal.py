@@ -63,7 +63,7 @@ def run_crossmodal() -> Dict[str, Any]:
         )
         
         # Instantiate model in full mode
-        model = ASRQualityClassifier(config, mode="full")
+        model = ASRQualityClassifier(config, mode="full").to(config.device)
         
         # Path to save fold model checkpoint
         checkpoint_path = config.paths.model_dir / f"crossmodal_fold{fold+1}.pt"

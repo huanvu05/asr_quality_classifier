@@ -162,7 +162,7 @@ class TrainingConfig:
     seed: int = 42
     n_folds: int = 5
     epochs: int = 50
-    batch_size: int = 32
+    batch_size: int = 4  # Reduced from 32 to 4 to prevent OOM during Cross-Attention
     learning_rate: float = 3e-4
     weight_decay: float = 1e-4
     early_stopping_patience: int = 10

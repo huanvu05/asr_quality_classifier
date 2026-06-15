@@ -21,113 +21,103 @@ def run_ensemble():
     
     out_dir = config.paths.output_dir
     
-    # Check if OOF files exist
-    baseline_path = out_dir / "baseline_oof_predictions.csv"
-    audio_path = out_dir / "deep_audio_oof_predictions.csv"
-    crossmodal_path = out_dir / "crossmodal_oof_predictions.csv"
+    # Define potential OOF files
+    oof_files = {
+        "Baseline": out_dir / "baseline_oof_predictions.csv",
+        "DeepAudio": out_dir / "deep_audio_oof_predictions.csv",
+        "CrossModal": out_dir / "crossmodal_oof_predictions.csv"
+    }
     
-    # If any file is missing, we will simulate running the phases sequentially
-    # or raise an error. For robustness, let's log error if missing.
-    missing = []
-    for p in [baseline_path, audio_path, crossmodal_path]:
-        if not p.exists():
-            missing.append(p.name)
+    available_preds = {}
+    df_base = None
+    y_true = None
+    
+    for name, path in oof_files.items():
+        if path.exists():
+            df = pd.read_csv(path)
+            available_preds[name] = df["oof_prob"].values
+            if df_base is None:
+                df_base = df
+                y_true = df["binary_label"].values
+            else:
+                assert (df_base["file_path"] == df["file_path"]).all()
+        else:
+            logger.warning(f"OOF predictions for {name} not found. It will be excluded from the ensemble.")
             
-    if missing:
-        logger.error(
-            f"Cannot run ensemble. The following OOF prediction files are missing: {missing}. "
-            "Please run phase2_baseline.py, phase3_deep_audio.py, and phase4_crossmodal.py first."
-        )
+    if not available_preds:
+        logger.error("No OOF prediction files found. Cannot run ensemble.")
         return
         
-    # Load predictions
-    df_base = pd.read_csv(baseline_path)
-    df_audio = pd.read_csv(audio_path)
-    df_cm = pd.read_csv(crossmodal_path)
+    if len(available_preds) == 1:
+        logger.error("Only one OOF prediction file found. Ensemble requires at least two models.")
+        return
     
-    # Verify alignment
-    assert (df_base["file_path"] == df_audio["file_path"]).all()
-    assert (df_base["file_path"] == df_cm["file_path"]).all()
-    
-    y_true = df_base["binary_label"].values
-    
-    p_base = df_base["oof_prob"].values
-    p_audio = df_audio["oof_prob"].values
-    p_cm = df_cm["oof_prob"].values
-    
-    # 1. Grid search for optimal blending weights
+    # 1. Grid search for optimal blending weights dynamically
     best_f1 = -1.0
-    best_weights = (0.33, 0.33, 0.34)
+    best_weights = {}
     best_threshold = 0.5
     
-    logger.info("Searching for optimal blending weights (grid search)...")
-    for w_base in np.linspace(0.0, 1.0, 11):
-        for w_audio in np.linspace(0.0, 1.0 - w_base, 11):
-            w_cm = 1.0 - w_base - w_audio
-            if w_cm < 0.0 or np.isclose(w_cm, 0.0):
-                w_cm = 0.0
-                
-            # Weighted probability blend
-            p_blend = w_base * p_base + w_audio * p_audio + w_cm * p_cm
+    # We will just do a simple search depending on available models
+    models = list(available_preds.keys())
+    
+    logger.info(f"Searching for optimal blending weights for: {models}...")
+    
+    if len(models) == 2:
+        for w1 in np.linspace(0.0, 1.0, 21):
+            w2 = 1.0 - w1
+            p_blend = w1 * available_preds[models[0]] + w2 * available_preds[models[1]]
             
-            # Sweep decision threshold
             for t in np.arange(0.1, 0.9, 0.02):
                 preds = (p_blend >= t).astype(int)
-                # Compute macro F1
                 from sklearn.metrics import f1_score
                 score = f1_score(y_true, preds, average="macro")
                 if score > best_f1:
                     best_f1 = score
-                    best_weights = (w_base, w_audio, w_cm)
+                    best_weights = {models[0]: w1, models[1]: w2}
                     best_threshold = t
-                    
-    w_base, w_audio, w_cm = best_weights
-    logger.info(
-        f"Optimal weights found: Baseline={w_base:.2f}, DeepAudio={w_audio:.2f}, CrossModal={w_cm:.2f} | "
-        f"Best Threshold: {best_threshold:.2f} | Best Val F1: {best_f1:.4f}"
-    )
+    elif len(models) == 3:
+        for w1 in np.linspace(0.0, 1.0, 11):
+            for w2 in np.linspace(0.0, 1.0 - w1, 11):
+                w3 = 1.0 - w1 - w2
+                if w3 < 0.0 or np.isclose(w3, 0.0): w3 = 0.0
+                
+                p_blend = w1 * available_preds[models[0]] + w2 * available_preds[models[1]] + w3 * available_preds[models[2]]
+                
+                for t in np.arange(0.1, 0.9, 0.02):
+                    preds = (p_blend >= t).astype(int)
+                    from sklearn.metrics import f1_score
+                    score = f1_score(y_true, preds, average="macro")
+                    if score > best_f1:
+                        best_f1 = score
+                        best_weights = {models[0]: w1, models[1]: w2, models[2]: w3}
+                        best_threshold = t
+                        
+    logger.info(f"Optimal weights found: {best_weights} | Best Threshold: {best_threshold:.2f} | Best Val F1: {best_f1:.4f}")
     
     # Compute final ensemble predictions
-    p_ensemble = w_base * p_base + w_audio * p_audio + w_cm * p_cm
+    p_ensemble = np.zeros_like(y_true, dtype=float)
+    for name, w in best_weights.items():
+        p_ensemble += w * available_preds[name]
+        
     preds_ensemble = (p_ensemble >= best_threshold).astype(int)
     
-    # Compute metrics
-    metrics_base = compute_metrics(y_true, (p_base >= 0.5).astype(int), p_base)
-    metrics_audio = compute_metrics(y_true, (p_audio >= 0.5).astype(int), p_audio)
-    metrics_cm = compute_metrics(y_true, (p_cm >= 0.5).astype(int), p_cm)
+    # Generate Results Table
+    results = []
+    for name, p_val in available_preds.items():
+        metrics = compute_metrics(y_true, (p_val >= 0.5).astype(int), p_val)
+        results.append({"model_name": name, "mode": "individual", **metrics})
+        
     metrics_ensemble = compute_metrics(y_true, preds_ensemble, p_ensemble)
+    results.append({"model_name": "Weighted Ensemble Blend", "mode": "ensemble_blend", **metrics_ensemble})
     
     # Plot ensemble confusion matrix
+    weight_str = "_".join([f"{k}={v:.1f}" for k, v in best_weights.items()])
     plot_confusion_matrix(
         y_true, 
         preds_ensemble, 
         str(out_dir / "ensemble_confusion_matrix.png"), 
-        title=f"Ensemble Confusion Matrix (w_base={w_base:.1f}, w_aud={w_audio:.1f}, w_cm={w_cm:.1f})"
+        title=f"Ensemble Confusion Matrix ({weight_str})"
     )
-    
-    # 2. Generate and save final ablation study comparison table
-    results = [
-        {
-            "model_name": "LightGBM Baseline",
-            "mode": "handcrafted_tabular",
-            **metrics_base
-        },
-        {
-            "model_name": "Deep Audio Branch",
-            "mode": "audio_only",
-            **metrics_audio
-        },
-        {
-            "model_name": "Cross-Modal Fusion",
-            "mode": "full",
-            **metrics_cm
-        },
-        {
-            "model_name": "Weighted Ensemble Blend",
-            "mode": "ensemble_blend",
-            **metrics_ensemble
-        }
-    ]
     
     ablation_csv_path = out_dir / "ablation_comparison_results.csv"
     generate_ablation_table(results, str(ablation_csv_path))

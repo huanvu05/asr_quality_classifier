@@ -10,6 +10,13 @@ Mục tiêu là xây dựng bộ phân loại nhị phân dự đoán nhãn: **1
 > 2. **KHÔNG tính toán WER/CER** (do không chạy ASR giải mã).
 > 3. **KHÔNG sử dụng** các đặc trưng rò rỉ thông tin như `annotator_id` hay `label_source`.
 > 4. Huấn luyện và phân chia dữ liệu theo cơ chế **GroupKFold** theo `folder` hoặc `transcript` để loại bỏ hoàn toàn hiện tượng rò rỉ dữ liệu (data leakage).
+> 5. Không hardcode credentials. Sử dụng biến môi trường `AZURE_SAS_TOKEN`.
+
+### 🤖 Pretrained Models
+
+Giải pháp này sử dụng các pretrained models sau (được HuggingFace tự động tải xuống qua class `AutoModel` khi chạy script):
+- **Audio Encoder:** `microsoft/wavlm-base-plus` (dùng để trích xuất acoustic fingerprint 768 chiều).
+- **Text Encoder:** `vinai/phobert-base-v2` (dùng cho Cross-Modal Alignment).
 
 ---
 

@@ -72,3 +72,11 @@ Despite achieving the optimal ensemble threshold, the model's Macro F1 caps at ~
 
 **Conclusion:** 
 The architecture successfully maxes out the acoustic assessment ceiling. To bridge the gap to a 0.78+ Macro F1, the dataset requires either rigorous consensus re-labeling or the relaxation of the "No ASR transcription" constraint to allow for semantic validation.
+
+---
+
+## 5. Submission Note on Deliverables
+
+Due to strict file size constraints on the blob storage container (the `microsoft/wavlm-base-plus` backbone causes each PyTorch `.pt` fold checkpoint to be approximately 922 MB), **only the single best-performing fold model (`deep_audio_fold2.pt`) and the 5 lightweight LightGBM folds (`baseline_fold*.pkl`) have been uploaded** to the `models/` directory.
+
+The included `infer.py` script is written dynamically. It will automatically detect the number of available folds in the `models/` directory and perform the 25% Tabular + 75% Deep Audio ensemble weighting accurately, whether exactly 1 or all 5 Deep Audio folds are present.

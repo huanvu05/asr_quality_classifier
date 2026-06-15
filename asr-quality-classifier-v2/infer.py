@@ -65,53 +65,73 @@ def main():
         logger.error(f"Failed to load audio for model encoder: {e}")
         sys.exit(1)
         
-    # Format tensors
-    ac_tensor = torch.tensor(ac_arr, dtype=torch.float32).unsqueeze(0)  # batch size 1
-    cm_tensor = torch.tensor(cm_arr, dtype=torch.float32).unsqueeze(0)
-    waveforms = [y]
-    texts = [args.transcript]
-    
-    # 3. Load trained cross-modal fusion model(s)
-    # Check if we have checkpoints
+    # 3. Load trained models
     model_dir = config.paths.model_dir
-    checkpoints = list(model_dir.glob("crossmodal_fold*.pt"))
     
-    if not checkpoints:
-        logger.error(
-            f"No trained model checkpoints found in {model_dir}. "
-            "Please run train.py to train the models first."
-        )
+    # We use the optimal ensemble: 25% Baseline + 75% Deep Audio
+    lgb_checkpoints = list(model_dir.glob("baseline_fold*.pkl"))
+    deep_checkpoints = list(model_dir.glob("deep_audio_fold*.pt"))
+    
+    if not lgb_checkpoints and not deep_checkpoints:
+        logger.error(f"No trained model checkpoints found in {model_dir}.")
         sys.exit(1)
         
-    logger.info(f"Found {len(checkpoints)} cross-modal checkpoints. Running ensemble prediction...")
+    logger.info(f"Found {len(lgb_checkpoints)} LGBM and {len(deep_checkpoints)} Deep Audio checkpoints.")
     
-    # Set model to evaluation on appropriate device
     device = config.device
     
-    all_probs = []
-    
-    # Run prediction across all available fold models
-    for cp_path in checkpoints:
-        # Load checkpoint
-        checkpoint = torch.load(str(cp_path), map_location=device)
-        best_threshold = checkpoint.get("best_threshold", 0.5)
+    # Evaluate Baseline (LightGBM)
+    base_probs = []
+    if lgb_checkpoints:
+        from src.classifier import TabularLGBMClassifier
+        import joblib
         
-        # Instantiate model in full mode
-        model = ASRQualityClassifier(config, mode="full")
-        model.load_state_dict(checkpoint["model_state_dict"])
-        model.to(device)
-        model.eval()
+        # Combine handcrafted and crossmodal for baseline
+        x_base = np.concatenate([ac_arr, cm_arr]).reshape(1, -1)
         
-        with torch.no_grad():
-            logits = model(waveforms, texts, ac_tensor, cm_tensor)
-            prob = torch.sigmoid(logits).item()
-            all_probs.append((prob, best_threshold))
+        for cp_path in lgb_checkpoints:
+            lgb_model = TabularLGBMClassifier(config)
+            lgb_model.model = joblib.load(str(cp_path))
+            prob = lgb_model.predict_proba(x_base)[0]
+            base_probs.append(prob)
             
-    # Calculate average probability and average threshold
-    avg_prob = np.mean([p for p, _ in all_probs])
-    avg_threshold = np.mean([t for _, t in all_probs])
+    avg_base_prob = np.mean(base_probs) if base_probs else 0.0
+
+    # Evaluate Deep Audio (WavLM + MLP)
+    deep_probs = []
+    if deep_checkpoints:
+        ac_tensor = torch.tensor(ac_arr, dtype=torch.float32).unsqueeze(0).to(device)
+        cm_tensor = torch.tensor(cm_arr, dtype=torch.float32).unsqueeze(0).to(device)
+        waveforms = [y]
+        texts = [args.transcript]
+        
+        for cp_path in deep_checkpoints:
+            checkpoint = torch.load(str(cp_path), map_location=device, weights_only=False)
+            model = ASRQualityClassifier(config, mode="audio_only")
+            model.load_state_dict(checkpoint["model_state_dict"])
+            model.to(device)
+            model.eval()
+            
+            with torch.no_grad():
+                logits = model(waveforms, texts, ac_tensor, cm_tensor)
+                prob = torch.sigmoid(logits).item()
+                deep_probs.append(prob)
+                
+    avg_deep_prob = np.mean(deep_probs) if deep_probs else 0.0
     
-    is_usable = avg_prob >= avg_threshold
+    # 4. Ensemble Prediction
+    # Use weights found in Phase 5
+    if base_probs and deep_probs:
+        final_prob = 0.25 * avg_base_prob + 0.75 * avg_deep_prob
+    elif deep_probs:
+        final_prob = avg_deep_prob
+    else:
+        final_prob = avg_base_prob
+        
+    # The optimal threshold found in Phase 5 was 0.78
+    best_threshold = 0.78
+    
+    is_usable = final_prob >= best_threshold
     label = 1 if is_usable else 0
     label_text = "usable" if is_usable else "unusable"
     
@@ -120,8 +140,10 @@ def main():
     print("=" * 50)
     print(f"Audio Path    : {args.audio}")
     print(f"Transcript    : {args.transcript}")
-    print(f"Confidence    : {avg_prob:.4f}")
-    print(f"Threshold     : {avg_threshold:.2f}")
+    print(f"LGBM Prob     : {avg_base_prob:.4f} (from {len(lgb_checkpoints)} folds)")
+    print(f"Deep Prob     : {avg_deep_prob:.4f} (from {len(deep_checkpoints)} folds)")
+    print(f"Final Blend   : {final_prob:.4f} (0.25*LGBM + 0.75*Deep)")
+    print(f"Threshold     : {best_threshold:.2f}")
     print(f"Prediction    : {label} ({label_text.upper()})")
     print("=" * 50 + "\n")
 
